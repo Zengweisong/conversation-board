@@ -1,0 +1,96 @@
+.ci-window-bar {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex: 0 0 40px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  padding-inline: 10px;
+  user-select: none;
+}
+.view-insights:has(.ci-workspace.has-projects) .ci-window-bar::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--ci-rail);
+}
+@media (min-width: 900px) {
+  .view-insights:has(.ci-workspace.has-projects) .ci-window-bar::before {
+    inset-inline-end: auto;
+    width: var(--ci-project-width);
+    border-inline-end: 1px solid var(--border);
+  }
+}
+.ci-window-bar button {
+  display: grid;
+  width: 30px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+}
+.ci-window-bar button:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.ci-window-bar .ci-sidebar-toggle {
+  margin-inline-end: auto;
+  cursor: pointer;
+}
+.ci-window-bar .ci-window-settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+  margin-inline-end: 6px;
+  padding-inline: 9px;
+  border-color: var(--border);
+  color: var(--text);
+  font-size: var(--font-xs);
+}
+.ci-window-bar .ci-window-close {
+  border-color: var(--border);
+  background: rgb(var(--card-rgb));
+}
+.ci-window-bar .ci-window-close:hover {
+  border-color: transparent;
+  background: #b33746;
+  color: #fff;
+}
+
+.ci-analysis-settings { padding: 12px 0; font-size: var(--font-sm); }
+.ci-analysis-settings summary { cursor: pointer; }
+.ci-analysis-settings form { display: grid; gap: 8px; margin-top: 10px; }
+.ci-analysis-settings label { display: grid; gap: 4px; }
+.ci-analysis-settings input, .ci-close-settings select {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  background: rgb(var(--input-rgb));
+}
+.ci-close-settings {
+  display: grid;
+  gap: 6px;
+  padding: 12px 0;
+  border-top: 1px solid var(--separator);
+  font-size: var(--font-sm);
+}
+.ci-close-dialog { width: min(360px, calc(100% - 32px)); color: var(--text); }
+.ci-close-dialog::backdrop { background: rgba(11, 15, 20, .38); }
+.ci-close-dialog .danger { background: #b33746; }
+.ci-remember-close {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  margin-bottom: 18px;
+  font-size: var(--font-sm);
+}
+.ci-remember-close input { accent-color: var(--accent-strong); }

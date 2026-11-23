@@ -1,0 +1,112 @@
+export type NotePriority = "low" | "normal" | "high";
+export type NoteScheduleSnapshot = Pick<Note,
+  "scheduledDate" | "scheduledTime" | "scheduledAt" | "reminderEnabled" | "reminderAt"
+  | "reminderOffsetMinutes" | "reminderTriggeredAt">;
+import type { BoardStatus } from "./board";
+
+export interface Note {
+  id: number;
+  title: string;
+  details: string | null;
+  categoryId: number | null;
+  completed: boolean;
+  pinned: boolean;
+  priority: NotePriority;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  dueAt: string | null;
+  sortOrder: number;
+  /** 仅在用户明确设置时间时存在的兼容时间戳。 */
+  scheduledAt: string | null;
+  /** 本地日历日期，格式为 YYYY-MM-DD；与具体时间独立持久化。 */
+  scheduledDate: string | null;
+  /** 用户明确设置的本地时间，格式为 HH:mm；仅日期事项为 null。 */
+  scheduledTime: string | null;
+  repeatSeriesId: number | null;
+  repeatOccurrenceAt: string | null;
+  reminderEnabled: boolean;
+  reminderAt: string | null;
+  reminderOffsetMinutes: number;
+  reminderTriggeredAt: string | null;
+  boardColumnId: string;
+  boardOrder: number;
+  status: BoardStatus;
+  previousBoardColumnId: string | null;
+}
+
+export interface NoteRow {
+  id: number;
+  title: string | null;
+  content: string;
+  details: string | null;
+  category_id: number | null;
+  completed: number;
+  pinned: number;
+  priority: NotePriority;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  due_at: string | null;
+  sort_order: number;
+  scheduled_at: string | null;
+  scheduled_date?: string | null;
+  scheduled_time?: string | null;
+  is_all_day?: number | null;
+  repeat_series_id: number | null;
+  repeat_occurrence_at: string | null;
+  reminder_enabled: number;
+  reminder_at: string | null;
+  reminder_offset_minutes: number;
+  reminder_triggered_at: string | null;
+  board_column_id?: string | null;
+  board_order?: number | null;
+  status?: BoardStatus | null;
+  previous_board_column_id?: string | null;
+}
+
+export interface NoteInput {
+  title: string;
+  details?: string | null;
+  categoryId?: number | null;
+  priority?: NotePriority;
+  scheduledAt?: string | null;
+  scheduledDate?: string | null;
+  scheduledTime?: string | null;
+  /** 仅供编辑旧版无法换算为提前量的提醒，保存时保持其原始时间。 */
+  legacyReminderAt?: string | null;
+  /** 事项时间控件的临时草稿，不直接持久化。 */
+  planDate?: string;
+  planTime?: string;
+  reminderEnabled?: boolean;
+  reminderOffsetMinutes?: number;
+  repeatEnabled?: boolean;
+  repeatType?: import("./repeat").RepeatType;
+  repeatInterval?: number;
+  repeatWeekdays?: number[];
+  repeatMonthDay?: number | null;
+  repeatEndType?: import("./repeat").RepeatEndType;
+  repeatEndDate?: string | null;
+  repeatMaxOccurrences?: number | null;
+  /** 重复系列的开始日期，与普通事项 scheduledAt 相互独立。 */
+  repeatStartDate?: string;
+  /** 重复系列自己的提醒开关，不复用普通事项 reminderEnabled。 */
+  repeatReminderEnabled?: boolean;
+  /** 每次重复发生当天的具体提醒时间，格式为 HH:mm。 */
+  repeatReminderTime?: string;
+  repeatEditScope?: "occurrence" | "series";
+  boardColumnId?: string;
+}
+
+export interface NoteUpdate extends NoteInput {}
+
+export interface ExportNote extends Omit<Note, "id"> { id?: number }
+
+export interface ExportPayloadV1 {
+  version: 1;
+  exportedAt: string;
+  notes: Array<{
+    id?: number; content: string; completed: boolean; pinned: boolean;
+    createdAt: string; updatedAt: string; completedAt: string | null; sortOrder: number;
+  }>;
+}

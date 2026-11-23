@@ -1,0 +1,566 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type PointerEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
+import { Archive, ArchiveRestore, ArrowLeft, ArrowUpRight, CalendarDays, Columns3, FolderClosed, GripVertical, MessageSquare, Pencil, Plus, RefreshCw, Search } from "lucide-react";
+import type { Note, NoteUpdate } from "../types/note";
+import type { Category } from "../types/category";
+import type { BoardStatus } from "../types/board";
+import type { RepeatSeries } from "../types/repeat";
+import { conversationProjectIds, conversationStats, conversationTasks, recentSyncDateRange, syncedInDateRange,
+  type ChatTaskSource, type CodexProject, type ProjectCatalog, type ProjectSettings, type SyncDateRange } from "../services/chatInsightsService";
+import { schedulePartsFromIso } from "../services/noteDateService";
+import { ConversationProjects } from "./ConversationProjects";
+import { CodexThreadPicker, ConversationTaskDispatch, conversationDispatchMessage, sendConversationTask } from "./ConversationTaskDispatch";
+import { NoteCard } from "./NoteCard";
+import { SelectField, type SelectOption } from "./SelectField";
+import "./ConversationDashboard.css";
+
+interface Props {
+  notes: Note[];
+  categories: Category[];
+  repeatSeries: RepeatSeries[];
+  sidebarCollapsed?: boolean;
+  appAlert?: ReactNode;
+  onOpenSettings: () => void;
+  onNotesChanged: () => Promise<void>;
+  onEdit: (id: number, input: NoteUpdate) => Promise<boolean>;
+  onStatusChange: (note: Note, status: BoardStatus) => Promise<boolean>;
+  saveDraftBeforeClose?: MutableRefObject<(() => Promise<boolean>) | null>;
+}
+interface SyncStatus { enabled: boolean; pending: number; failed: number; lastError?: string | null; }
+const emptyCatalog: ProjectCatalog = { projects: [], sessionProjects: {} };
+const columns = [
+  { id: "todo", label: "待处理" },
+  { id: "doing", label: "进行中" },
+  { id: "completed", label: "已完成" }
+] as const;
+const recentPeriods = { today: 1, week: 7, month: 30 } as const;
+type Period = "all" | "custom" | keyof typeof recentPeriods;
+const periodOptions: readonly SelectOption<Period>[] = [
+  { value: "all", label: "全部日期" },
+  { value: "today", label: "今天" },
+  { value: "week", label: "近 7 天" },
+  { value: "month", label: "近 30 天" },
+  { value: "custom", label: "自定义日期" }
+];
+const emptyDateRange: SyncDateRange = { start: "", end: "" };
+const taskStatus = (note: Note): BoardStatus => note.completed ? "completed" : note.status;
+const dateLabel = (value: string | null) => {
+  if (!value || Number.isNaN(new Date(value).getTime())) return "时间未知";
+  return new Date(value).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+};
+
+export function ConversationDashboard({ notes, categories, repeatSeries, sidebarCollapsed = false, appAlert, onOpenSettings, onNotesChanged, onEdit, onStatusChange, saveDraftBeforeClose }: Props) {
+  const [sources, setSources] = useState<ChatTaskSource[] | null>(null);
+  const [sync, setSync] = useState<SyncStatus | null>(null);
+  const [catalog, setCatalog] = useState<ProjectCatalog | null>(null);
+  const [projectError, setProjectError] = useState("");
+  const catalogRevision = useRef(0);
+  const sourceRevision = useRef(0);
+  const [error, setError] = useState("");
+  const [refresh, setRefresh] = useState(0);
+  const [reading, setReading] = useState(false);
+  const [search, setSearch] = useState("");
+  const [project, setProject] = useState("all");
+  const [trackedOnly, setTrackedOnly] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const [draft, setDraft] = useState<{ content: string; projectId: string } | null>(null);
+  const [choosingDraftThread, setChoosingDraftThread] = useState(false);
+  const [adding, setAdding] = useState<"save" | "send" | null>(null);
+  const addInFlight = useRef(false);
+  const outsideSaveInFlight = useRef<Promise<boolean> | null>(null);
+  const [addError, setAddError] = useState("");
+  const [addFeedback, setAddFeedback] = useState<{ message: string; error: boolean } | null>(null);
+  const [period, setPeriod] = useState<Period>("all");
+  const [customDates, setCustomDates] = useState(emptyDateRange);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const dashboardRef = useRef<HTMLElement>(null);
+  const archiveToggle = useRef<HTMLButtonElement>(null);
+  const addTrigger = useRef<HTMLButtonElement>(null);
+  const addForm = useRef<HTMLFormElement>(null);
+  const draftThreadTrigger = useRef<HTMLButtonElement>(null);
+  const returnToAddTrigger = useRef(false);
+  const editTrigger = useRef<HTMLButtonElement | null>(null);
+  const editing = notes.find(({ id }) => id === editingId);
+  const [moving, setMoving] = useState(false);
+  const [moveError, setMoveError] = useState("");
+  const boardRef = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ noteId: number; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
+  const [preview, setPreview] = useState<{ noteId: number; x: number; y: number; target?: BoardStatus } | null>(null);
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || !drag.current) return;
+      drag.current = null;
+      setPreview(null);
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, []);
+  useEffect(() => {
+    if (editing) return;
+    editTrigger.current?.focus({ preventScroll: true });
+    editTrigger.current = null;
+  }, [editing]);
+  useEffect(() => {
+    if (draft || !returnToAddTrigger.current) return;
+    returnToAddTrigger.current = false;
+    addTrigger.current?.focus({ preventScroll: true });
+  }, [draft]);
+  const openEditor = (noteId: number, trigger: HTMLButtonElement) => {
+    editTrigger.current = trigger;
+    setEditingId(noteId);
+  };
+  useEffect(() => {
+    let active = true;
+    let pending = false;
+    const read = async () => {
+      if (pending) return;
+      pending = true;
+      const readingRevision = catalogRevision.current;
+      const readingSourceRevision = sourceRevision.current;
+      setReading(true);
+      try {
+        const [tasks, status, projects] = await Promise.allSettled([
+          invoke<ChatTaskSource[]>("get_chat_sync_tasks"), invoke<SyncStatus>("get_chat_sync_status"),
+          invoke<ProjectCatalog>("get_chat_sync_projects")
+        ]);
+        if (!active) return;
+        if (readingRevision === catalogRevision.current) {
+          if (projects.status === "fulfilled") { setCatalog(projects.value); setProjectError(""); }
+          else setProjectError(String(projects.reason));
+        }
+        if (tasks.status === "fulfilled" && readingSourceRevision === sourceRevision.current) setSources(tasks.value);
+        if (status.status === "fulfilled") setSync(status.value);
+        setError(tasks.status === "rejected" ? String(tasks.reason) : status.status === "rejected" ? String(status.reason) : "");
+      }
+      finally { pending = false; if (active) setReading(false); }
+    };
+    void read();
+    const timer = window.setInterval(() => void read(), 4000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [refresh, notes]);
+
+  const tasks = useMemo(() => conversationTasks(notes, sources ?? []), [notes, sources]);
+  const projectIds = useMemo(() => conversationProjectIds(tasks, categories, catalog ?? emptyCatalog), [tasks, categories, catalog]);
+  const registered = [...(catalog?.projects ?? [])].sort((a, b) => Number(b.settings.tracked) - Number(a.settings.tracked));
+  const registeredById = new Map(registered.map((item) => [item.id, item]));
+  const projectsByLabel = new Map<string, typeof registered>();
+  for (const item of registered) {
+    const label = item.settings.displayName ?? item.name;
+    const group = projectsByLabel.get(label) ?? [];
+    group.push(item);
+    projectsByLabel.set(label, group);
+  }
+  const projectDescriptions = new Map<string, string>();
+  for (const group of projectsByLabel.values()) {
+    if (group.length === 1) continue;
+    for (const { id, rootPaths } of group) {
+      const path = rootPaths[0];
+      const sharesPath = group.some((item) => item.id !== id && item.rootPaths[0] === path);
+      const suffix = `#${id.slice(-6)}`;
+      projectDescriptions.set(id, path ? sharesPath ? `${path} · ${suffix}` : path : suffix);
+    }
+  }
+  const legacy = [...new Set(projectIds.values())].filter((id) => id.startsWith("category:"));
+  const visibleProjectIds = registered.filter(({ hidden, settings }) => !hidden && (!trackedOnly || settings.tracked)).map(({ id }) => id);
+  const options = trackedOnly ? visibleProjectIds : [...visibleProjectIds, ...legacy];
+  const railCoversProjectFilter = !sidebarCollapsed && visibleProjectIds.length > 0 && (trackedOnly || legacy.length === 0);
+  const activeProject = options.includes(project) ? project : "all";
+  const categoryFor = (id: string) => categories.find((category) => `category:${category.id}` === id);
+  const projectName = (id: string) => {
+    const item = registeredById.get(id);
+    return item ? item.settings.displayName ?? item.name : categoryFor(id)?.name ?? "未分类";
+  };
+  const projectOption = (id: string) => {
+    const label = projectName(id);
+    return projectDescriptions.has(id) ? `${label} · #${id.slice(-6)}` : label;
+  };
+  const activeProjectPath = projectDescriptions.get(activeProject) ?? registeredById.get(activeProject)?.rootPaths.join("\n");
+  const dateRange = period === "all" ? emptyDateRange : period === "custom" ? customDates : recentSyncDateRange(recentPeriods[period]);
+  const invalidDates = Boolean(dateRange.start && dateRange.end && dateRange.start > dateRange.end);
+  const periodTasks = tasks.filter((task) => syncedInDateRange(task, dateRange));
+  const archivedCount = tasks.filter(({ sources }) => sources[0].archived).length;
+  const boardTasks = periodTasks.filter(({ sources }) => sources[0].archived === showArchived);
+  const counts = new Map<string, number>();
+  for (const { note } of boardTasks) {
+    const id = projectIds.get(note.id)!;
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  const searchTerm = search.trim().toLocaleLowerCase();
+  const scopedTasks = periodTasks.filter(({ note }) => {
+    const id = projectIds.get(note.id)!;
+    const registeredProject = registeredById.get(id);
+    return !registeredProject?.hidden && (!trackedOnly || registeredProject?.settings.tracked)
+      && (activeProject === "all" || id === activeProject)
+      && `${note.title} ${note.details ?? ""}`.toLocaleLowerCase().includes(searchTerm);
+  });
+  const filtered = scopedTasks.filter(({ sources }) => sources[0].archived === showArchived);
+  const stats = conversationStats(scopedTasks.filter(({ sources }) => !sources[0].archived));
+  const hasFilters = activeProject !== "all" || trackedOnly || period !== "all" || Boolean(searchTerm);
+  const noMatchingTasks = filtered.length === 0 && hasFilters && (!showArchived || archivedCount > 0);
+  const emptyProject = activeProject !== "all" && !tasks.some(({ note }) => projectIds.get(note.id) === activeProject);
+  const editorSources = tasks.find(({ note }) => note.id === editingId)?.sources.filter(({ evidence }) => evidence) ?? [];
+  const closeDraft = useCallback((restoreFocus = true) => {
+    returnToAddTrigger.current = restoreFocus;
+    setChoosingDraftThread(false);
+    setDraft(null);
+  }, []);
+  const addTask = useCallback(async ({ threadId, outsideClick = false }: { threadId?: string | null; outsideClick?: boolean } = {}) => {
+    if (addInFlight.current || !draft?.content.trim()) return false;
+    const [firstLine, ...body] = draft.content.trim().split(/\r\n?|\n/);
+    const title = firstLine.trim();
+    const details = body.join("\n").trim();
+    const projectId = draft.projectId || null;
+    addInFlight.current = true;
+    setAdding(threadId === undefined ? "save" : "send");
+    setAddError("");
+    setAddFeedback(null);
+    try {
+      const task = await invoke<ChatTaskSource>("create_chat_board_task", { title, details, projectId });
+      sourceRevision.current++;
+      setSources((current) => [...(current ?? []).filter((source) => source.noteId !== task.noteId), task]);
+      let feedback: typeof addFeedback = null;
+      if (threadId !== undefined) {
+        try {
+          const message = conversationDispatchMessage(await sendConversationTask(task.noteId, threadId, projectId));
+          if (message) feedback = { message, error: false };
+        } catch (error) {
+          feedback = { message: `事项已添加，可在卡片上重试发送。\n${String(error)}`, error: true };
+        }
+      }
+      try {
+        await onNotesChanged();
+      } catch {
+        feedback = { message: [feedback?.message, "事项已添加，刷新列表失败。"].filter(Boolean).join("\n"), error: true };
+      }
+      setAddFeedback(feedback);
+      closeDraft(!outsideClick);
+      if (!outsideClick) {
+        setShowArchived(false); setSearch(""); setPeriod("all");
+        setProject(projectId ?? "all"); setTrackedOnly(false);
+      }
+      return true;
+    } catch (error) {
+      setAddError(outsideClick ? `自动保存失败，内容已保留。\n${String(error)}` : String(error));
+      return false;
+    }
+    finally { addInFlight.current = false; setAdding(null); }
+  }, [closeDraft, draft, onNotesChanged]);
+  const saveDraft = useCallback(() => {
+    if (outsideSaveInFlight.current) return outsideSaveInFlight.current;
+    if (addInFlight.current) return Promise.resolve(false);
+    if (!draft?.content.trim()) return Promise.resolve(true);
+    const save = addTask({ outsideClick: true }).finally(() => { outsideSaveInFlight.current = null; });
+    outsideSaveInFlight.current = save;
+    return save;
+  }, [addTask, draft]);
+  useEffect(() => {
+    if (!saveDraftBeforeClose) return;
+    saveDraftBeforeClose.current = saveDraft;
+    return () => { saveDraftBeforeClose.current = null; };
+  }, [saveDraft, saveDraftBeforeClose]);
+  useEffect(() => {
+    if (!draft || choosingDraftThread || showArchived) return;
+    const shell = dashboardRef.current?.closest(".app-shell") ?? dashboardRef.current;
+    const handleOutsideClick = (event: MouseEvent) => {
+      const form = addForm.current;
+      const target = event.target;
+      if (!form || addInFlight.current || event.button !== 0 || !(target instanceof Node)
+        || !shell?.contains(target) || form.contains(target)
+        || (target instanceof Element && target.closest("[data-window-close-control]"))) return;
+      if (!draft.content.trim()) {
+        closeDraft(false);
+        return;
+      }
+      void saveDraft();
+    };
+    document.addEventListener("click", handleOutsideClick, true);
+    return () => document.removeEventListener("click", handleOutsideClick, true);
+  }, [choosingDraftThread, closeDraft, draft, saveDraft, showArchived]);
+  const changeStatus = async (note: Note, status: BoardStatus) => {
+    if (moving || taskStatus(note) === status) return;
+    setMoving(true);
+    setMoveError("");
+    try {
+      if (!await onStatusChange(note, status)) setMoveError("事项状态未保存，请重试。");
+    } catch (error) { setMoveError(String(error)); }
+    finally { setMoving(false); }
+  };
+  const setArchived = async (noteId: number, archived: boolean, trigger: HTMLButtonElement) => {
+    if (moving) return;
+    const returnFocus = document.activeElement === trigger;
+    setMoving(true);
+    setMoveError("");
+    try {
+      await invoke("set_chat_sync_task_archived", { noteId, archived });
+      sourceRevision.current++;
+      setSources((current) => current?.map((source) => source.noteId === noteId ? { ...source, archived } : source) ?? null);
+      if (returnFocus && (document.activeElement === trigger || document.activeElement === document.body)) {
+        archiveToggle.current?.focus({ preventScroll: true });
+      }
+    } catch (error) { setMoveError(String(error)); }
+    finally { setMoving(false); }
+  };
+  const statusAt = (x: number, y: number) => {
+    const target = document.elementFromPoint(x, y)?.closest<HTMLElement>(".ci-column[data-status]");
+    if (target && boardRef.current?.contains(target)) return columns.find(({ id }) => id === target.dataset.status)?.id;
+  };
+  const startDrag = (event: PointerEvent<HTMLButtonElement>, noteId: number) => {
+    if (event.button !== 0 || drag.current || moving) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current = { noteId, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, active: false };
+  };
+  const moveDrag = (event: PointerEvent<HTMLButtonElement>) => {
+    const current = drag.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    const { clientX: x, clientY: y } = event;
+    if (!current.active && Math.hypot(x - current.startX, y - current.startY) < 6) return;
+    current.active = true;
+    const target = statusAt(x, y);
+    const note = filtered.find(({ note }) => note.id === current.noteId)?.note;
+    if (note) setPreview({ noteId: note.id, x, y, target: target === taskStatus(note) ? undefined : target });
+  };
+  const finishDrag = (event: PointerEvent<HTMLButtonElement>, drop: boolean) => {
+    const current = drag.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    drag.current = null;
+    setPreview(null);
+    if (!drop || !current.active) return;
+    const target = statusAt(event.clientX, event.clientY);
+    const note = filtered.find(({ note }) => note.id === current.noteId)?.note;
+    if (target && note) void changeStatus(note, target);
+  };
+  const updateProject = (projectId: string, patch: Partial<Pick<CodexProject, "settings" | "hidden">>) => {
+    catalogRevision.current++;
+    setCatalog((current) => current && {
+      ...current, projects: current.projects.map((item) => item.id === projectId ? { ...item, ...patch } : item)
+    });
+  };
+  const saveProject = async (projectId: string, settings: ProjectSettings) => {
+    const saved = await invoke<ProjectSettings>("save_chat_sync_project", {
+      projectId, displayName: settings.displayName ?? "", tracked: settings.tracked
+    });
+    updateProject(projectId, { settings: saved });
+  };
+  const setProjectHidden = async (projectId: string, hidden: boolean) => {
+    await invoke("set_chat_sync_project_hidden", { projectId, hidden });
+    updateProject(projectId, { hidden });
+    if (hidden) setProject((current) => current === projectId ? "all" : current);
+  };
+
+  return <section ref={dashboardRef} className="ci-dashboard" aria-label="对话分析看板">
+    <div className={`ci-workspace ${!sidebarCollapsed && (catalog || projectError) ? "has-projects" : ""}`}>
+      <aside id="ci-project-sidebar" className="ci-project-rail" aria-label="项目侧边栏" hidden={sidebarCollapsed}>
+        {projectError && <p className="ci-error" role="alert">{projectError}
+          <button type="button" onClick={() => setRefresh((value) => value + 1)}>重新读取项目</button></p>}
+        {catalog && <ConversationProjects projects={registered} counts={counts} descriptions={projectDescriptions}
+          selected={activeProject} trackedOnly={trackedOnly}
+          onSelect={setProject} onTrackedOnly={(enabled) => { setTrackedOnly(enabled); setProject("all"); }}
+          onSave={saveProject} onSetHidden={setProjectHidden} />}
+      </aside>
+      <section className="ci-actions" aria-label="行动看板">
+        {appAlert}
+        <header className="ci-header">
+          <div className="ci-title">
+            <span className="ci-title-icon"><Columns3 size={22} aria-hidden="true" /></span>
+            <div>
+              <h1>对话看板</h1>
+              <div className="ci-connection">
+                <span className={`ci-signal ${sync?.enabled ? "connected" : ""}`} />
+                <span>{sync ? sync.enabled ? "自动同步已开启" : "同步未连接" : "正在读取同步状态"}</span>
+                {sync?.pending ? <span>{sync.pending} 轮待分析</span> : null}
+                {sync?.failed ? <span className="ci-warning">{sync.failed} 轮分析失败</span> : null}
+              </div>
+            </div>
+          </div>
+          {sources && <div className="ci-metrics" role="group" aria-label="未归档事项概览">
+            <span className="ci-metric">事项 <strong>{stats.total}</strong></span>
+            <span className="ci-metric">关联对话 <strong>{stats.sessions}</strong></span>
+            {stats.overdue > 0 && <span className="ci-metric ci-warning">{stats.overdue} 项已过期</span>}
+            <div className="ci-completion">
+              <span>完成率</span>
+              <div className="ci-progress-track" role="progressbar" aria-label="事项完成率"
+                aria-valuemin={0} aria-valuemax={100} aria-valuenow={stats.completionRate}><i style={{ width: `${stats.completionRate}%` }} /></div>
+              <strong>{stats.completionRate}%</strong>
+            </div>
+          </div>}
+          <div className="ci-header-actions">
+            <button className="ci-refresh" type="button" aria-label="刷新对话看板" title="刷新看板" disabled={reading}
+              onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={15} /></button>
+            <button className="ci-sync-settings" type="button" onClick={onOpenSettings}>
+              {sync?.enabled ? "同步设置" : "连接对话"}<ArrowUpRight size={14} />
+            </button>
+          </div>
+        </header>
+        {error && <p className="ci-error" role="alert">读取失败：{error}<button type="button" onClick={() => setRefresh((value) => value + 1)}>重试</button></p>}
+        {moveError && <p className="ci-error" role="alert">{moveError}</p>}
+        {addFeedback && <p className={addFeedback.error ? "ci-error" : "ci-filter-empty"}
+          role={addFeedback.error ? "alert" : "status"}>{addFeedback.message}</p>}
+        {showArchived && draft && addError && <p className="ci-error" role="alert">{addError}</p>}
+        {sources === null ? <div className="ci-empty" role="status"><MessageSquare size={30} /><h2>{error ? "暂时无法读取看板" : "正在整理对话事项…"}</h2><p>从本机同步记录读取来源与进度。</p></div> : <>
+          <div className="ci-board-controls">
+            <div className="ci-toolbar">
+              <div className="ci-period-picker">
+                <SelectField label="同步日期范围" variant="toolbar" value={period} options={periodOptions}
+                  leadingIcon={<CalendarDays size={14} />} onChange={setPeriod} />
+              </div>
+              <div className={`ci-project-picker${railCoversProjectFilter ? " ci-project-picker-redundant" : ""}`}>
+                <SelectField label="项目筛选" variant="toolbar" value={activeProject} title={activeProjectPath || undefined}
+                  leadingIcon={<FolderClosed size={14} />} onChange={setProject}
+                  options={[{ value: "all", label: trackedOnly ? "追踪的项目" : "所有项目" },
+                    ...options.map((id) => ({ value: id, label: projectOption(id) }))]} />
+              </div>
+              <label className="ci-search"><Search size={15} aria-hidden="true" /><input aria-label="搜索对话事项" placeholder="搜索事项" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
+              <button className="ci-archive-toggle" type="button" ref={archiveToggle} onClick={() => {
+                setShowArchived(!showArchived); setMoveError("");
+              }}>{showArchived ? <ArrowLeft size={14} aria-hidden="true" /> : <Archive size={14} aria-hidden="true" />}
+                {showArchived ? "返回看板" : `已归档 ${archivedCount}`}</button>
+            </div>
+            {period === "custom" && <div className="ci-date-range" role="group" aria-label="自定义同步日期">
+              <label>开始日期<input type="date" value={customDates.start} max={customDates.end || undefined} aria-invalid={invalidDates}
+                onChange={(event) => setCustomDates({ ...customDates, start: event.target.value })} /></label>
+              <label>结束日期<input type="date" value={customDates.end} min={customDates.start || undefined} aria-invalid={invalidDates}
+                onChange={(event) => setCustomDates({ ...customDates, end: event.target.value })} /></label>
+              {invalidDates && <span className="ci-warning" role="alert">开始日期不能晚于结束日期</span>}
+            </div>}
+          </div>
+          {noMatchingTasks && <div className="ci-filter-empty">
+            <span role="status">{emptyProject ? "此项目暂无同步事项" : "没有匹配的事项"}</span>
+            <button type="button" onClick={() => { setSearch(""); setProject("all"); setTrackedOnly(false); setPeriod("all"); setCustomDates(emptyDateRange); }}>清除筛选</button>
+          </div>}
+          {showArchived && !filtered.length ? (!noMatchingTasks && <div className="ci-empty"><h2>暂无归档事项</h2></div>)
+          : <>
+            <div className="ci-board" ref={boardRef}>{columns.map((column) => {
+              const items = filtered.filter(({ note }) => taskStatus(note) === column.id);
+              const canAdd = !showArchived && column.id === "todo";
+              return <section className={`ci-column ci-${column.id}${preview?.target === column.id ? " drop-target" : ""}`} key={column.id} aria-label={column.label} data-status={column.id}>
+                <header><span className="ci-state-dot" /><h3>{column.label}</h3><span className="ci-column-count">{items.length}</span></header>
+                <div className="ci-column-scroll" role="group" aria-label={`${column.label}事项`}
+                  tabIndex={items.length > 0 || (canAdd && draft) ? 0 : undefined}>
+                  {!items.length && !canAdd && <p className="ci-column-empty">暂无事项</p>}
+                  {items.map(({ note, sources: evidence }) => {
+                    const completedAt = note.completed ? note.completedAt : null;
+                    const { date, time } = schedulePartsFromIso(completedAt);
+                    const summary = evidence.find((source) => source.evidence)?.evidence || note.details;
+                    const projectId = projectIds.get(note.id)!;
+                    const taskProject = evidence.find((source) => source.manual && source.projectId)?.projectId
+                      ?? (registeredById.has(projectId) ? projectId : null);
+                    const dispatch = evidence.find(({ dispatchThreadId }) => dispatchThreadId);
+                    const preferredThreadId = dispatch?.dispatchThreadId ?? evidence.find((source) => source.manual && source.sessionId)?.sessionId ?? evidence.find(({ sessionId }) => sessionId)?.sessionId ?? "";
+                    return <article className={`ci-task${preview?.noteId === note.id ? " dragging" : ""}`} key={note.id}
+                      onClick={(event) => {
+                        const { target, currentTarget } = event;
+                        if (!(target instanceof Element) || !currentTarget.contains(target) || target.closest("button, a, .ci-task-dispatch")) return;
+                        const trigger = currentTarget.querySelector<HTMLButtonElement>(".ci-task-open");
+                        if (trigger) openEditor(note.id, trigger);
+                      }}>
+                      <div className="ci-task-meta">
+                        <span className="ci-task-project" title={projectName(projectId)}>{projectName(projectId)}</span>
+                      </div>
+                      <button type="button" className="ci-task-open" aria-label={`编辑：${note.title}`} aria-haspopup="dialog"
+                        onClick={(event) => openEditor(note.id, event.currentTarget)}>
+                        <strong>{note.title}</strong>{summary && <span className="ci-task-evidence">{summary}</span>}
+                      </button>
+                      {(canAdd || Boolean(preferredThreadId)) && <ConversationTaskDispatch noteId={note.id} title={note.title} disabled={moving} canSend={canAdd}
+                        projectId={taskProject} projectLabel={taskProject && registeredById.has(taskProject) ? projectOption(taskProject) : undefined}
+                        preferredThreadId={preferredThreadId} onSent={onNotesChanged}
+                        dispatchState={dispatch?.dispatchState} />}
+                      <div className="ci-task-footer">
+                        {completedAt && date && time && <time className="ci-task-completed-at" dateTime={completedAt}
+                          title={`完成于 ${date} ${time}`}>完成于 {date} {time}</time>}
+                        <div className="ci-task-actions">
+                          <button type="button" title={showArchived ? "恢复事项" : "归档事项"} disabled={moving}
+                            aria-label={`${showArchived ? "恢复事项" : "归档事项"} ${note.title}`}
+                            onClick={(event) => void setArchived(note.id, !showArchived, event.currentTarget)}>
+                            {showArchived ? <ArchiveRestore size={14} aria-hidden="true" /> : <Archive size={14} aria-hidden="true" />}
+                          </button>
+                          <button type="button" className="ci-task-edit" title="编辑事项" aria-label={`编辑事项 ${note.title}`} aria-haspopup="dialog"
+                            onClick={(event) => openEditor(note.id, event.currentTarget)}><Pencil size={14} aria-hidden="true" /></button>
+                          <button type="button" className="ci-task-drag" aria-label={`拖动事项 ${note.title}`} disabled={moving}
+                            onPointerDown={(event) => startDrag(event, note.id)} onPointerMove={moveDrag}
+                            onPointerUp={(event) => finishDrag(event, true)} onPointerCancel={(event) => finishDrag(event, false)}
+                            onLostPointerCapture={(event) => finishDrag(event, false)}><GripVertical size={15} aria-hidden="true" /></button>
+                        </div>
+                      </div>
+                    </article>;
+                  })}
+                  {canAdd && draft && <form ref={addForm} className="ci-create-task" aria-label="添加待处理事项" onSubmit={(event) => { event.preventDefault(); void addTask(); }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Escape" || adding) return;
+                      event.preventDefault();
+                      closeDraft();
+                    }}>
+                    <textarea autoFocus required aria-label="待处理事项内容" placeholder="首行写标题，换行补充说明"
+                      rows={4} value={draft.content} disabled={adding !== null} onChange={(event) => setDraft({ ...draft, content: event.target.value })} />
+                    {visibleProjectIds.length > 0 && <select aria-label="待处理事项项目" value={draft.projectId} disabled={adding !== null}
+                      onChange={(event) => setDraft({ ...draft, projectId: event.target.value })}>
+                      <option value="">不指定项目</option>
+                      {visibleProjectIds.map((id) => <option key={id} value={id}>{projectOption(id)}</option>)}
+                    </select>}
+                    {!choosingDraftThread && addError && <p className="ci-error" role="alert">{addError}</p>}
+                    <div className="ci-create-task-dispatch ci-send-buttons" role="group" aria-label="添加并发送给 Codex">
+                      <button type="button" className="ci-send-new" disabled={adding !== null || !draft.content.trim()}
+                        onClick={() => void addTask({ threadId: null })}>{adding === "send" && !choosingDraftThread ? "发送中…" : "开启新对话"}</button>
+                      <button type="button" ref={draftThreadTrigger} disabled={adding !== null || !draft.content.trim()}
+                        onClick={() => { setAddError(""); setChoosingDraftThread(true); }}>沿用之前对话</button>
+                    </div>
+                    <div className="ci-create-task-actions">
+                      <button type="button" disabled={adding !== null} onClick={() => closeDraft()}>取消</button>
+                      <button type="submit" disabled={adding !== null || !draft.content.trim()}>{adding === "save" ? "保存中…" : "添加"}</button>
+                    </div>
+                  </form>}
+                </div>
+                {canAdd && !draft && <button ref={addTrigger} className="ci-add-task" type="button" aria-label="添加待处理事项" onClick={() => {
+                  setAddError("");
+                  setDraft({ content: "", projectId: registeredById.has(activeProject) ? activeProject : "" });
+                }}><Plus size={16} aria-hidden="true" />添加事项</button>}
+                {canAdd && draft && choosingDraftThread && createPortal(
+                  <CodexThreadPicker key={draft.projectId} projectId={draft.projectId || null}
+                    projectLabel={draft.projectId ? projectOption(draft.projectId) : undefined}
+                    preferredId="" sending={adding !== null} sendError={addError} onSend={(threadId) => void addTask({ threadId })}
+                    onClose={() => { setChoosingDraftThread(false); setAddError(""); draftThreadTrigger.current?.focus({ preventScroll: true }); }} />,
+                  dashboardRef.current?.closest(".app-shell") ?? document.body,
+                )}
+              </section>;
+            })}</div>
+            {preview && <span className="ci-drag-preview" aria-hidden="true" style={{ left: preview.x + 12, top: preview.y + 10 }}>
+              {filtered.find(({ note }) => note.id === preview.noteId)?.note.title}
+            </span>}
+          </>}
+        </>}
+      </section>
+    </div>
+    {editing && createPortal(
+      <div className="dialog-backdrop board-detail-backdrop">
+        <div className="board-detail-dialog ci-editor-dialog" role="dialog" aria-modal="true" aria-label="编辑事项"
+          onKeyDown={(event) => {
+            if (event.key !== "Tab" || event.defaultPrevented) return;
+            const controls = [...event.currentTarget.querySelectorAll<HTMLElement>(
+              "button, input, textarea, select, summary, [contenteditable='true']"
+            )].filter((control) => control.tabIndex >= 0 && !control.matches(":disabled") && control.getClientRects().length > 0);
+            const first = controls[0];
+            const last = controls[controls.length - 1];
+            const edge = event.shiftKey ? first : last;
+            if (edge === document.activeElement) {
+              event.preventDefault();
+              (event.shiftKey ? last : first)?.focus();
+            }
+          }}>
+          <div className="board-detail-heading"><strong>编辑事项</strong></div>
+          <NoteCard key={editing.id} note={editing} categories={categories}
+            repeatSeries={repeatSeries.find(({ id }) => id === editing.repeatSeriesId)}
+            onEdit={(input) => onEdit(editing.id, input)} onCloseEditor={() => setEditingId(null)}
+            editorSupplement={editorSources.length > 0 && <details className="ci-editor-sources">
+              <summary>事项依据</summary>
+              {editorSources.map((source) => <div className="ci-source" key={source.sessionId}>
+                <blockquote>{source.evidence}</blockquote>
+                <time dateTime={source.syncedAt ?? undefined}>{dateLabel(source.syncedAt)}</time>
+                <details><summary>来源对话</summary><code>{source.sessionId}</code></details>
+              </div>)}
+            </details>} />
+        </div>
+      </div>, dashboardRef.current?.closest(".app-shell") ?? document.body
+    )}
+  </section>;
+}
