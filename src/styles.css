@@ -127,24 +127,21 @@ button:active:not(:disabled) { transform: scale(.965); transition-duration: 80ms
   --separator: rgba(255, 255, 255, .08);
 }
 
-.theme-green, .app-shell.view-insights.theme-dark {
-  --panel-rgb: 36, 38, 34;
-  --card-rgb: 51, 55, 49;
-  --text: #f0f1e9;
-  --muted: #bcc3b7;
-  --accent: #97d4ab;
-  --accent-strong: #afe0c0;
-  --accent-soft: #3b5143;
-}
-
 .theme-green {
   color-scheme: dark;
   --glass-glow: 173, 206, 176;
   --glass-glow-strength: .17;
   --glass-tint: 91, 138, 106;
   --glass-shade: 25, 52, 39;
+  --panel-rgb: 36, 38, 34;
+  --card-rgb: 51, 55, 49;
   --input-rgb: 43, 48, 42;
+  --text: #f0f1e9;
+  --muted: #bcc3b7;
   --faint: #a0ae9e;
+  --accent: #97d4ab;
+  --accent-strong: #afe0c0;
+  --accent-soft: #3b5143;
   --accent-ink: #1b3325;
   --border: rgba(220, 239, 219, .16);
   --card-border: rgba(220, 239, 219, .12);
@@ -749,9 +746,28 @@ textarea::placeholder, input::placeholder {
   border-radius: 7px;
   cursor: pointer;
 }
-.select-field-popover [role="option"] > span { overflow-wrap: anywhere; }
+.select-field-popover [role="option"] .select-field-value > span:last-child { overflow-wrap: anywhere; }
 .select-field-popover [aria-selected="true"] { color: var(--accent-strong); font-weight: 650; }
 .select-field-popover [role="option"].active { background: var(--accent-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent); }
+.select-field-popover[data-variant="form"] {
+  width: min(var(--popover-anchor-width, 146px), calc(100vw - 20px));
+  padding: 5px;
+  border-color: var(--border);
+  border-radius: 11px;
+  background: rgb(var(--card-rgb));
+  box-shadow: 0 10px 28px #0003, 0 2px 6px #0002;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.select-field-popover[data-variant="form"]:not([data-positioned]) { visibility: hidden; }
+.select-field-popover[data-variant="form"]::-webkit-scrollbar { display: initial; width: 6px; }
+.select-field-popover[data-variant="form"]::-webkit-scrollbar-thumb { border-radius: 3px; background: var(--border); }
+.select-field-popover[data-variant="form"] [role="option"] { min-height: 35px; padding: 5px 9px; }
+.select-field-popover[data-variant="form"] [aria-selected="true"] { background: var(--accent-soft); }
+.select-field-popover[data-variant="form"] [role="option"].active:not([aria-selected="true"]) {
+  background: var(--separator);
+  box-shadow: none;
+}
 .theme-dark .calendar-picker-popover { --picker-selection: var(--accent); --picker-selection-ink: #1b2637; }
 .theme-green .calendar-picker-popover { --picker-selection: var(--accent); --picker-selection-ink: var(--accent-ink); }
 .date-popover-header, .calendar-picker-footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
@@ -1053,11 +1069,30 @@ textarea::placeholder, input::placeholder {
   cursor: pointer;
 }
 .select-field-trigger > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.select-field-value { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.select-field-trigger .select-field-value > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.select-field-swatch {
+  flex: 0 0 13px;
+  height: 13px;
+  border: 1px solid rgba(128, 128, 128, .55);
+  border-radius: 4px;
+}
 .select-field-trigger > svg { color: var(--muted); }
-.select-field-trigger:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 46%, var(--card-border)); }
+.select-field-trigger:hover:not(:disabled, [aria-disabled="true"]) { border-color: color-mix(in srgb, var(--accent) 46%, var(--card-border)); }
 .select-field-trigger[aria-expanded="true"] > svg { transform: rotate(180deg); color: var(--accent-strong); }
 .select-field-trigger:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
-.select-field-trigger:disabled { opacity: .48; cursor: default; }
+.select-field-trigger:is(:disabled, [aria-disabled="true"]) { opacity: .48; cursor: default; }
+.select-field-trigger[aria-disabled="true"]:active { transform: none; }
+.select-field[data-variant="form"] .select-field-trigger {
+  min-height: 38px;
+  border-color: var(--border);
+  background: rgb(var(--input-rgb));
+  font-size: var(--font-sm);
+}
+.select-field[data-variant="form"] .select-field-trigger[aria-expanded="true"],
+.select-field[data-variant="form"] .select-field-trigger:hover:not(:disabled, [aria-disabled="true"]) {
+  border-color: color-mix(in srgb, var(--accent-strong) 50%, var(--border));
+}
 .note-edit-fields {
   min-width: 0;
   display: grid;

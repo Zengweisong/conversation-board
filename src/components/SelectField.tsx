@@ -5,31 +5,38 @@ import { useAnchoredPopover } from "../hooks/useAnchoredPopover";
 
 type SelectValue = string | number;
 
-export interface SelectOption<T extends SelectValue> { value: T; label: string; }
+export interface SelectOption<T extends SelectValue> { value: T; label: string; swatch?: string; }
 
 interface Props<T extends SelectValue> {
+  id?: string;
   label: string;
   value: T | null;
   options: readonly SelectOption<T>[];
   onChange: (value: T) => void;
   leadingIcon?: ReactNode;
-  variant?: "toolbar";
+  variant?: "toolbar" | "form";
+  disabled?: boolean;
   title?: string;
 }
 
-export function SelectField<const T extends SelectValue>({ label, value, options, onChange, leadingIcon, variant, title }: Props<T>) {
+export function SelectField<const T extends SelectValue>({ id, label, value, options, onChange, leadingIcon, variant, disabled, title }: Props<T>) {
   const listId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const search = useRef({ text: "", at: 0 });
   const [index, setIndex] = useState<number | null>(null);
-  const active = index === null || !options.length ? null : Math.min(index, options.length - 1);
+  const active = index === null || disabled || !options.length ? null : Math.min(index, options.length - 1);
   const open = active !== null;
   const selected = options.findIndex((option) => option.value === value);
+  const selection = options[selected];
   const dismiss = useCallback(() => {
     setIndex(null);
     search.current.text = "";
   }, []);
-  const { field, popup, portalRoot } = useAnchoredPopover(open, dismiss, { matchAnchor: true, preferBelow: variant === "toolbar" });
+  const { field, popup, portalRoot } = useAnchoredPopover(open, dismiss, { matchAnchor: true, preferBelow: variant !== undefined });
+
+  useLayoutEffect(() => {
+    if (disabled) dismiss();
+  }, [disabled, dismiss]);
 
   useLayoutEffect(() => {
     if (active === null) return;
@@ -49,7 +56,7 @@ export function SelectField<const T extends SelectValue>({ label, value, options
   };
 
   const handleKey = (event: KeyboardEvent<HTMLButtonElement>) => {
-    if (event.nativeEvent.isComposing || !options.length) return;
+    if (disabled || event.nativeEvent.isComposing || !options.length) return;
     const { key } = event;
     if (key === "Tab") { dismiss(); return; }
     if (key === "Escape" && open) {
@@ -92,15 +99,23 @@ export function SelectField<const T extends SelectValue>({ label, value, options
     }
   };
 
-  return <div ref={field} className="select-field">
-    <button ref={trigger} type="button" role="combobox" className="select-field-trigger" aria-label={label}
+  return <div ref={field} className="select-field" data-variant={variant}>
+    <button id={id} ref={trigger} type="button" role="combobox" className="select-field-trigger" aria-label={label}
       title={title ?? (variant === "toolbar" ? options[selected]?.label : undefined)}
       aria-expanded={open} aria-controls={open ? listId : undefined}
       aria-activedescendant={active === null ? undefined : `${listId}-${active}`}
-      disabled={!options.length} onKeyDown={handleKey}
-      onClick={() => open ? dismiss() : setIndex(Math.max(selected, 0))}>
+      disabled={!options.length} aria-disabled={disabled || undefined} onKeyDown={handleKey}
+      onClick={() => {
+        if (disabled) return;
+        if (open) dismiss();
+        else setIndex(Math.max(selected, 0));
+      }}>
       {leadingIcon && <span className="select-field-icon" aria-hidden="true">{leadingIcon}</span>}
-      <span>{options[selected]?.label ?? "请选择"}</span><ChevronDown size={14} aria-hidden="true" />
+      <span className="select-field-value">
+        {selection?.swatch && <span className="select-field-swatch" style={{ backgroundColor: selection.swatch }} aria-hidden="true" />}
+        <span>{selection?.label ?? "请选择"}</span>
+      </span>
+      <ChevronDown size={14} aria-hidden="true" />
     </button>
     {open && createPortal(
       <div ref={popup} id={listId} className="select-field-popover" role="listbox" aria-label={label} data-variant={variant}
@@ -109,7 +124,11 @@ export function SelectField<const T extends SelectValue>({ label, value, options
           aria-selected={position === selected} className={active === position ? "active" : undefined}
           onPointerMove={() => setIndex(position)} onMouseDown={(event) => event.preventDefault()}
           onClick={() => choose(option)}>
-          <span>{option.label}</span>{position === selected && <Check size={14} />}
+          <span className="select-field-value">
+            {option.swatch && <span className="select-field-swatch" style={{ backgroundColor: option.swatch }} aria-hidden="true" />}
+            <span>{option.label}</span>
+          </span>
+          {position === selected && <Check size={14} aria-hidden="true" />}
         </div>)}
       </div>,
       portalRoot

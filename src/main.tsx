@@ -6,21 +6,37 @@ import { Minus, PanelLeftClose, PanelLeftOpen, Settings, Square, X } from "lucid
 import { ChatSyncSettings } from "./components/ChatSyncSettings";
 import { SyncAnalysisSettings } from "./components/SyncAnalysisSettings";
 import { ConversationDashboard } from "./components/ConversationDashboard";
+import { SelectField, type SelectOption } from "./components/SelectField";
 import { useBoard } from "./hooks/useBoard";
 import { useCategories } from "./hooks/useCategories";
 import { useNotes } from "./hooks/useNotes";
 import { listBoardColumns } from "./services/boardService";
 import { startBackgroundTaskService } from "./services/backgroundTaskService";
-import { loadSettings, saveCloseAction } from "./services/settingsService";
+import { loadSettings, saveCloseAction, saveTheme } from "./services/settingsService";
 import type { BoardStatus } from "./types/board";
 import type { Note } from "./types/note";
-import type { AppSettings, CloseAction } from "./types/settings";
+import type { AppSettings, CloseAction, ThemeName } from "./types/settings";
 import "./styles.css";
 import "./window.css";
+
+const themeOptions: readonly SelectOption<ThemeName>[] = [
+  { value: "warm", label: "暖色", swatch: "#eeebe4" },
+  { value: "light", label: "浅色", swatch: "#e8eef6" },
+  { value: "dark", label: "深色", swatch: "#292e37" },
+  { value: "green", label: "墨绿色", swatch: "#3b5143" }
+];
+
+const closeActionOptions: readonly SelectOption<CloseAction>[] = [
+  { value: "ask", label: "每次询问" },
+  { value: "minimize", label: "最小化到任务栏" },
+  { value: "quit", label: "直接关闭" }
+];
 
 function ConversationBoardApp() {
   const [error, setError] = useState("");
   const [appearance, setAppearance] = useState<AppSettings | null>(null);
+  const [themeBusy, setThemeBusy] = useState(false);
+  const [themeError, setThemeError] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
   const [closeError, setCloseError] = useState("");
@@ -29,7 +45,7 @@ function ConversationBoardApp() {
   const closeDialog = useRef<HTMLDialogElement>(null);
   const rememberChoice = useRef<HTMLInputElement>(null);
   const closeAction = useRef<CloseAction>("ask");
-  const closeActionRevision = useRef(0);
+  const settingsRevision = useRef(0);
   const closeInFlight = useRef(false);
   const saveDraftBeforeClose = useRef<(() => Promise<boolean>) | null>(null);
   const notes = useNotes(setError);
@@ -43,9 +59,9 @@ function ConversationBoardApp() {
   useEffect(() => {
     let disposed = false;
     const readAppearance = async () => {
-      const revision = closeActionRevision.current;
+      const revision = settingsRevision.current;
       const settings = await loadSettings();
-      if (disposed || revision !== closeActionRevision.current) return;
+      if (disposed || revision !== settingsRevision.current) return;
       closeAction.current = settings.closeAction;
       setAppearance(settings);
     };
@@ -59,7 +75,7 @@ function ConversationBoardApp() {
 
   const updateCloseAction = useCallback(async (action: CloseAction) => {
     await saveCloseAction(action);
-    closeActionRevision.current++;
+    settingsRevision.current++;
     closeAction.current = action;
     setAppearance((current) => current && { ...current, closeAction: action });
   }, []);
@@ -152,12 +168,27 @@ function ConversationBoardApp() {
 
   const appWindow = getCurrentWindow();
   const openSettings = () => {
+    setThemeError("");
     setCloseSettingsError("");
     settings.current?.showModal();
   };
   const sidebarAction = sidebarCollapsed ? "展开侧边栏" : "收起侧边栏";
   function runWindowAction(action: Promise<void>) {
     void action.catch((error) => setError(String(error)));
+  }
+
+  async function changeTheme(theme: ThemeName) {
+    setThemeBusy(true);
+    setThemeError("");
+    try {
+      await saveTheme(theme);
+      settingsRevision.current++;
+      setAppearance((current) => current && { ...current, theme });
+    } catch (error) {
+      setThemeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setThemeBusy(false);
+    }
   }
 
   async function changeCloseAction(action: CloseAction) {
@@ -202,16 +233,18 @@ function ConversationBoardApp() {
     <dialog id="ci-settings-dialog" ref={settings} aria-label="设置"
       style={{ width: "min(420px, calc(100% - 32px))", border: "1px solid var(--border)", borderRadius: 12,
         padding: 20, background: "rgb(var(--card-rgb))", color: "var(--text)" }}>
+      <div className="ci-setting-field">
+        <label htmlFor="ci-theme">主题</label>
+        <SelectField id="ci-theme" label="主题" variant="form" value={appearance.theme}
+          options={themeOptions} disabled={themeBusy} onChange={(theme) => void changeTheme(theme)} />
+        {themeError && <p className="chat-sync-error" role="alert">{themeError}</p>}
+      </div>
       <ChatSyncSettings onChanged={refresh} />
       <SyncAnalysisSettings />
-      <div className="ci-close-settings">
+      <div className="ci-setting-field">
         <label htmlFor="ci-close-action">关闭窗口时</label>
-        <select id="ci-close-action" value={appearance.closeAction} disabled={closeBusy}
-          onChange={(event) => void changeCloseAction(event.target.value as CloseAction)}>
-          <option value="ask">每次询问</option>
-          <option value="minimize">最小化到任务栏</option>
-          <option value="quit">直接关闭</option>
-        </select>
+        <SelectField id="ci-close-action" label="关闭窗口时" variant="form" value={appearance.closeAction}
+          options={closeActionOptions} disabled={closeBusy} onChange={(action) => void changeCloseAction(action)} />
         {closeSettingsError && <p className="chat-sync-error" role="alert">{closeSettingsError}</p>}
       </div>
       <form method="dialog"><button type="submit">关闭</button></form>

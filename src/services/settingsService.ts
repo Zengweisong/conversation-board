@@ -166,16 +166,33 @@ export function saveSettings(settings: AppSettings): Promise<void> {
   return operation;
 }
 
-export async function saveCloseAction(closeAction: CloseAction): Promise<void> {
-  try {
+async function patchSettings(changes: Partial<AppSettings>): Promise<void> {
+  const operation = saveQueue.catch(() => undefined).then(async () => {
     const db = await getDatabase();
     await db.execute(
       `INSERT INTO settings (key, value, updated_at) VALUES ('app', $1, $2)
        ON CONFLICT(key) DO UPDATE SET
          value = json_patch(CASE WHEN json_valid(settings.value) THEN settings.value ELSE '{}' END, excluded.value),
          updated_at = excluded.updated_at`,
-      [JSON.stringify({ closeAction }), new Date().toISOString()]
+      [JSON.stringify(changes), new Date().toISOString()]
     );
+  });
+  saveQueue = operation;
+  await operation;
+}
+
+export async function saveTheme(theme: ThemeName): Promise<void> {
+  try {
+    await patchSettings({ theme });
+  } catch (error) {
+    console.error("保存主题失败:", error);
+    throw new Error("保存主题失败，请重试");
+  }
+}
+
+export async function saveCloseAction(closeAction: CloseAction): Promise<void> {
+  try {
+    await patchSettings({ closeAction });
   } catch (error) {
     console.error("保存关闭行为失败:", error);
     throw new Error("保存关闭行为失败，请重试");

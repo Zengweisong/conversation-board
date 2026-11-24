@@ -16,7 +16,7 @@ export function useAnchoredPopover(open: boolean, dismiss: () => void, { compact
       const below = window.innerHeight - anchor.bottom - gap;
       if (matchAnchor) {
         panel.style.setProperty("--popover-anchor-width", `${anchor.width}px`);
-        panel.style.setProperty("--popover-room", `${Math.max(above, below) - margin}px`);
+        panel.style.setProperty("--popover-room", `${Math.max(0, Math.max(above, below) - margin)}px`);
       }
       const fitsBelow = panel.offsetHeight <= below - margin;
       const opensAbove = (panel.offsetHeight <= above || above >= below) && !(preferBelow && fitsBelow);
@@ -26,6 +26,7 @@ export function useAnchoredPopover(open: boolean, dismiss: () => void, { compact
       panel.style.top = `${Math.max(margin, Math.min(top, window.innerHeight - panel.offsetHeight - margin))}px`;
       const left = matchAnchor ? anchor.left : anchor.right - panel.offsetWidth;
       panel.style.left = `${Math.max(margin, Math.min(left, window.innerWidth - panel.offsetWidth - margin))}px`;
+      panel.dataset.positioned = "";
     };
     const followScroll = (event: Event) => {
       if (!(event.target instanceof Node) || !popup.current?.contains(event.target)) place();
@@ -53,5 +54,6 @@ export function useAnchoredPopover(open: boolean, dismiss: () => void, { compact
     };
   }, [open, dismiss]);
 
-  return { field, popup, portalRoot: field.current?.closest(".app-shell") ?? document.body };
+  // Keep a portaled choice inside its modal and any form that saves on outside clicks.
+  return { field, popup, portalRoot: field.current?.closest("dialog, [data-popover-root], .app-shell") ?? document.body };
 }

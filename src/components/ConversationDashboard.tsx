@@ -485,7 +485,7 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
                       </div>
                     </article>;
                   })}
-                  {canAdd && draft && <form ref={addForm} className="ci-create-task" aria-label="添加待处理事项" onSubmit={(event) => { event.preventDefault(); void addTask(); }}
+                  {canAdd && draft && <form ref={addForm} className="ci-create-task" data-popover-root aria-label="添加待处理事项" onSubmit={(event) => { event.preventDefault(); void addTask(); }}
                     onKeyDown={(event) => {
                       if (event.key !== "Escape" || adding) return;
                       event.preventDefault();
@@ -493,11 +493,11 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
                     }}>
                     <textarea autoFocus required aria-label="待处理事项内容" placeholder="首行写标题，换行补充说明"
                       rows={4} value={draft.content} disabled={adding !== null} onChange={(event) => setDraft({ ...draft, content: event.target.value })} />
-                    {visibleProjectIds.length > 0 && <select aria-label="待处理事项项目" value={draft.projectId} disabled={adding !== null}
-                      onChange={(event) => setDraft({ ...draft, projectId: event.target.value })}>
-                      <option value="">不指定项目</option>
-                      {visibleProjectIds.map((id) => <option key={id} value={id}>{projectOption(id)}</option>)}
-                    </select>}
+                    {visibleProjectIds.length > 0 && <SelectField label="待处理事项项目" variant="form"
+                      value={draft.projectId} disabled={adding !== null}
+                      options={[{ value: "", label: "不指定项目" },
+                        ...visibleProjectIds.map((id) => ({ value: id, label: projectOption(id) }))]}
+                      onChange={(projectId) => setDraft({ ...draft, projectId })} />}
                     {!choosingDraftThread && addError && <p className="ci-error" role="alert">{addError}</p>}
                     <div className="ci-create-task-dispatch ci-send-buttons" role="group" aria-label="添加并发送给 Codex">
                       <button type="button" className="ci-send-new" disabled={adding !== null || !draft.content.trim()}

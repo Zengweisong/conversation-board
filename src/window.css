@@ -67,7 +67,7 @@
 .ci-analysis-settings summary { cursor: pointer; }
 .ci-analysis-settings form { display: grid; gap: 8px; margin-top: 10px; }
 .ci-analysis-settings label { display: grid; gap: 4px; }
-.ci-analysis-settings input, .ci-close-settings select {
+.ci-analysis-settings input {
   width: 100%;
   padding: 7px 9px;
   border: 1px solid var(--border);
@@ -75,13 +75,14 @@
   color: var(--text);
   background: rgb(var(--input-rgb));
 }
-.ci-close-settings {
+.ci-setting-field {
   display: grid;
   gap: 6px;
   padding: 12px 0;
   border-top: 1px solid var(--separator);
   font-size: var(--font-sm);
 }
+.ci-setting-field:first-child { padding-top: 0; border-top: 0; }
 .ci-close-dialog { width: min(360px, calc(100% - 32px)); color: var(--text); }
 .ci-close-dialog::backdrop { background: rgba(11, 15, 20, .38); }
 .ci-close-dialog .danger { background: #b33746; }

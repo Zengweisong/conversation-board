@@ -241,7 +241,7 @@ it("adds the first item directly inside the selected project's pending column", 
   expect(document.activeElement).toBe(trigger());
 
   await act(async () => trigger().click());
-  expect(form().querySelector<HTMLSelectElement>("select")?.value).toBe("empty");
+  expect(filterTrigger("待处理事项项目").textContent).toBe("还没有事项的项目");
   await enterTaskContent(form(), "项目的第一个事项");
   await act(async () => form().dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   expect(invoke).toHaveBeenCalledWith("create_chat_board_task", { title: "项目的第一个事项", details: "", projectId: "empty" });
@@ -277,14 +277,17 @@ it("closes a blank composer and saves a filled one without overriding the clicke
   expect(document.activeElement).toBe(search);
   expect(invoke).not.toHaveBeenCalledWith("create_chat_board_task", expect.anything());
 
-  await act(async () => projects[1].click());
   await act(async () => trigger().click());
   await enterTaskContent(form(), "记录测试结果\n\n补上两条说明");
+  const picker = filterTrigger("待处理事项项目");
+  await act(async () => picker.click());
+  const projectOption = filterOptions(picker).find((option) => option.textContent === "还没有事项的项目")!;
   await act(async () => {
-    form().querySelector("select")!.click();
+    projectOption.click();
     document.body.click();
   });
   expect(form()).not.toBeNull();
+  expect(picker.textContent).toBe("还没有事项的项目");
   expect(invoke).not.toHaveBeenCalledWith("create_chat_board_task", expect.anything());
   await act(async () => projects[0].click());
   expect(invoke).toHaveBeenCalledWith("create_chat_board_task", { title: "记录测试结果", details: "补上两条说明", projectId: "empty" });
@@ -355,10 +358,9 @@ it("adds a pending item, sends it in a new conversation, or lets the user choose
   await act(async () => container.querySelector<HTMLButtonElement>(".ci-add-task")!.click());
   const form = container.querySelector<HTMLFormElement>(".ci-create-task")!;
   await enterTaskContent(form, "补齐接口文档\n补上两个示例");
-  await act(async () => {
-    const project = form.querySelector<HTMLSelectElement>("select")!;
-    project.value = "app"; project.dispatchEvent(new Event("change", { bubbles: true }));
-  });
+  const project = filterTrigger("待处理事项项目");
+  await act(async () => project.click());
+  await act(async () => filterOptions(project).find((option) => option.textContent === "开发工具")!.click());
   await act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   expect(invoke).toHaveBeenCalledWith("create_chat_board_task", { title: "补齐接口文档", details: "补上两个示例", projectId: "app" });
   const findCard = (column: string) => [...container.querySelectorAll(`.ci-${column} .ci-task`)].find((item) => item.textContent?.includes("补齐接口文档"))!;

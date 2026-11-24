@@ -2,8 +2,10 @@
   --ci-project-width: clamp(198px, 20%, 248px);
   --ci-rail: #eeebe4;
 }
-.app-shell.view-insights:is(.theme-dark, .theme-green) { --ci-rail: #2d302b; }
-.app-shell.view-insights:not(.theme-dark, .theme-green) {
+.app-shell.view-insights.theme-light { --ci-rail: #e8eef6; }
+.app-shell.view-insights.theme-dark { --ci-rail: #292e37; }
+.app-shell.view-insights.theme-green { --ci-rail: #2d302b; }
+.app-shell.view-insights.theme-warm {
   --panel-rgb: 251, 250, 247;
   --card-rgb: 255, 254, 250;
   --text: #292d29;
@@ -35,7 +37,6 @@
   line-height: 1.5;
 }
 :is(.theme-dark, .theme-green) .ci-dashboard {
-  --ci-inset: #2a2d28;
   --ci-danger: #ff9d99;
   --ci-green: #97d4ab;
   --ci-red: #ff939b;
@@ -43,6 +44,9 @@
   --ci-yellow: #f5d170;
   --ci-yellow-dot: #f1c54d;
 }
+.theme-light .ci-dashboard { --ci-inset: #edf2f8; }
+.theme-dark .ci-dashboard { --ci-inset: #262b33; }
+.theme-green .ci-dashboard { --ci-inset: #2a2d28; }
 .ci-dashboard button { cursor: pointer; }
 .ci-dashboard button:active:not(:disabled) { transform: scale(.98); }
 .ci-dashboard button:disabled { cursor: default; opacity: .5; }
@@ -168,9 +172,7 @@
 .ci-add-task { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; min-height: 42px; padding: 6px; border: 1px solid transparent; border-radius: 9px; color: var(--accent-strong); background: var(--accent-soft); font-size: .9em; font-weight: 600; }
 .ci-add-task:hover { border-color: color-mix(in srgb, var(--accent-strong) 35%, transparent); }
 .ci-create-task { display: grid; gap: 8px; min-width: 0; padding: 9px; border: 1px solid color-mix(in srgb, var(--accent-strong) 36%, var(--border)); border-radius: 8px; background: var(--ci-surface); font-size: .88em; }
-.ci-create-task :is(input, textarea, select) { width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--ci-inset); font: inherit; }
-.ci-create-task select { text-overflow: ellipsis; }
-.ci-create-task option { background: rgb(var(--card-rgb)); color: var(--text); }
+.ci-create-task :is(input, textarea) { width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--ci-inset); font: inherit; }
 .ci-create-task textarea { resize: vertical; }
 .ci-create-task-actions { justify-content: flex-end; }
 .ci-create-task-actions button[type="button"] { color: var(--muted); background: transparent; border-color: transparent; }
