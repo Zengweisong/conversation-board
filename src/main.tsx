@@ -7,14 +7,10 @@ import { ChatSyncSettings } from "./components/ChatSyncSettings";
 import { SyncAnalysisSettings } from "./components/SyncAnalysisSettings";
 import { ConversationDashboard } from "./components/ConversationDashboard";
 import { SelectField, type SelectOption } from "./components/SelectField";
-import { useBoard } from "./hooks/useBoard";
 import { useCategories } from "./hooks/useCategories";
 import { useNotes } from "./hooks/useNotes";
-import { listBoardColumns } from "./services/boardService";
 import { startBackgroundTaskService } from "./services/backgroundTaskService";
 import { loadSettings, saveCloseAction, saveTheme } from "./services/settingsService";
-import type { BoardStatus } from "./types/board";
-import type { Note } from "./types/note";
 import type { AppSettings, CloseAction, ThemeName } from "./types/settings";
 import "./styles.css";
 import "./window.css";
@@ -50,7 +46,6 @@ function ConversationBoardApp() {
   const saveDraftBeforeClose = useRef<(() => Promise<boolean>) | null>(null);
   const notes = useNotes(setError);
   const categories = useCategories(setError);
-  const board = useBoard(setError, notes.refresh);
   const refresh = useCallback(async () => {
     await Promise.all([notes.refresh(), categories.refresh()]);
   }, [notes.refresh, categories.refresh]);
@@ -147,23 +142,6 @@ function ConversationBoardApp() {
     };
   }, [refresh]);
 
-  async function changeStatus(note: Note, status: BoardStatus) {
-    setError("");
-    try {
-      let columns = await listBoardColumns();
-      if (status === "doing" && !columns.some((column) => column.status === status)) {
-        if (!await board.create("进行中")) return false;
-        columns = await listBoardColumns();
-      }
-      const target = columns.find((column) => column.status === status);
-      if (!target) throw new Error("找不到对应的状态栏目");
-      return await board.moveNote(note.id, target.id, null);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "移动事项失败");
-      return false;
-    }
-  }
-
   if (!appearance) return null;
 
   const appWindow = getCurrentWindow();
@@ -214,8 +192,9 @@ function ConversationBoardApp() {
         onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}>
         {sidebarCollapsed ? <PanelLeftOpen size={17} aria-hidden="true" /> : <PanelLeftClose size={17} aria-hidden="true" />}
       </button>
-      <button type="button" className="ci-window-settings" aria-haspopup="dialog" aria-controls="ci-settings-dialog" onClick={openSettings}>
-        <Settings size={15} aria-hidden="true" />设置
+      <button type="button" className="ci-window-settings" aria-label="设置" title="设置"
+        aria-haspopup="dialog" aria-controls="ci-settings-dialog" onClick={openSettings}>
+        <Settings size={15} aria-hidden="true" />
       </button>
       <button type="button" aria-label="最小化" title="最小化" onClick={() => runWindowAction(appWindow.minimize())}><Minus size={16} /></button>
       <button type="button" aria-label="最大化或还原" title="最大化或还原" onClick={() => runWindowAction(appWindow.toggleMaximize())}><Square size={13} /></button>
@@ -223,12 +202,12 @@ function ConversationBoardApp() {
         data-window-close-control onClick={requestClose}><X size={17} /></button>
     </header>
     <div className="content-viewport" style={{ flex: 1 }}>
-      <ConversationDashboard notes={notes.notes} categories={categories.categories} repeatSeries={notes.repeatSeries}
-        sidebarCollapsed={sidebarCollapsed} onOpenSettings={openSettings} onNotesChanged={refresh}
+      <ConversationDashboard notes={notes.notes} categories={categories.categories}
+        sidebarCollapsed={sidebarCollapsed} onNotesChanged={refresh}
         appAlert={error && <div className="ci-error" role="alert">
           {error} <button type="button" onClick={() => setError("")}>关闭提示</button>
         </div>}
-        onEdit={notes.edit} onStatusChange={changeStatus} saveDraftBeforeClose={saveDraftBeforeClose} />
+        onEdit={notes.editContent} saveDraftBeforeClose={saveDraftBeforeClose} />
     </div>
     <dialog id="ci-settings-dialog" ref={settings} aria-label="设置"
       style={{ width: "min(420px, calc(100% - 32px))", border: "1px solid var(--border)", borderRadius: 12,
@@ -264,5 +243,7 @@ function ConversationBoardApp() {
     </dialog>
   </main>;
 }
+
+document.addEventListener("contextmenu", (event) => event.preventDefault(), { capture: true });
 
 ReactDOM.createRoot(document.getElementById("root")!).render(<ConversationBoardApp />);

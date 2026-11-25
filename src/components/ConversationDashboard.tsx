@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type PointerEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { Archive, ArchiveRestore, ArrowLeft, ArrowUpRight, CalendarDays, Columns3, FolderClosed, GripVertical, MessageSquare, Pencil, Plus, RefreshCw, Search } from "lucide-react";
-import type { Note, NoteUpdate } from "../types/note";
+import { Archive, ArchiveRestore, ArrowLeft, CalendarDays, Columns3, FolderClosed, MessageSquare, Pencil, Plus, RefreshCw, Search } from "lucide-react";
+import type { Note, NoteContentUpdate } from "../types/note";
 import type { Category } from "../types/category";
 import type { BoardStatus } from "../types/board";
-import type { RepeatSeries } from "../types/repeat";
 import { conversationProjectIds, conversationStats, conversationTasks, recentSyncDateRange, syncedInDateRange,
   type ChatTaskSource, type CodexProject, type ProjectCatalog, type ProjectSettings, type SyncDateRange } from "../services/chatInsightsService";
 import { schedulePartsFromIso } from "../services/noteDateService";
@@ -18,13 +17,10 @@ import "./ConversationDashboard.css";
 interface Props {
   notes: Note[];
   categories: Category[];
-  repeatSeries: RepeatSeries[];
   sidebarCollapsed?: boolean;
   appAlert?: ReactNode;
-  onOpenSettings: () => void;
   onNotesChanged: () => Promise<void>;
-  onEdit: (id: number, input: NoteUpdate) => Promise<boolean>;
-  onStatusChange: (note: Note, status: BoardStatus) => Promise<boolean>;
+  onEdit: (id: number, input: NoteContentUpdate) => Promise<boolean>;
   saveDraftBeforeClose?: MutableRefObject<(() => Promise<boolean>) | null>;
 }
 interface SyncStatus { enabled: boolean; pending: number; failed: number; lastError?: string | null; }
@@ -50,7 +46,7 @@ const dateLabel = (value: string | null) => {
   return new Date(value).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 };
 
-export function ConversationDashboard({ notes, categories, repeatSeries, sidebarCollapsed = false, appAlert, onOpenSettings, onNotesChanged, onEdit, onStatusChange, saveDraftBeforeClose }: Props) {
+export function ConversationDashboard({ notes, categories, sidebarCollapsed = false, appAlert, onNotesChanged, onEdit, saveDraftBeforeClose }: Props) {
   const [sources, setSources] = useState<ChatTaskSource[] | null>(null);
   const [sync, setSync] = useState<SyncStatus | null>(null);
   const [catalog, setCatalog] = useState<ProjectCatalog | null>(null);
@@ -82,20 +78,8 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
   const returnToAddTrigger = useRef(false);
   const editTrigger = useRef<HTMLButtonElement | null>(null);
   const editing = notes.find(({ id }) => id === editingId);
-  const [moving, setMoving] = useState(false);
-  const [moveError, setMoveError] = useState("");
-  const boardRef = useRef<HTMLDivElement>(null);
-  const drag = useRef<{ noteId: number; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
-  const [preview, setPreview] = useState<{ noteId: number; x: number; y: number; target?: BoardStatus } | null>(null);
-  useEffect(() => {
-    const close = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented || !drag.current) return;
-      drag.current = null;
-      setPreview(null);
-    };
-    window.addEventListener("keydown", close);
-    return () => window.removeEventListener("keydown", close);
-  }, []);
+  const [archiving, setArchiving] = useState(false);
+  const [archiveError, setArchiveError] = useState("");
   useEffect(() => {
     if (editing) return;
     editTrigger.current?.focus({ preventScroll: true });
@@ -277,20 +261,11 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
     document.addEventListener("click", handleOutsideClick, true);
     return () => document.removeEventListener("click", handleOutsideClick, true);
   }, [choosingDraftThread, closeDraft, draft, saveDraft, showArchived]);
-  const changeStatus = async (note: Note, status: BoardStatus) => {
-    if (moving || taskStatus(note) === status) return;
-    setMoving(true);
-    setMoveError("");
-    try {
-      if (!await onStatusChange(note, status)) setMoveError("事项状态未保存，请重试。");
-    } catch (error) { setMoveError(String(error)); }
-    finally { setMoving(false); }
-  };
   const setArchived = async (noteId: number, archived: boolean, trigger: HTMLButtonElement) => {
-    if (moving) return;
+    if (archiving) return;
     const returnFocus = document.activeElement === trigger;
-    setMoving(true);
-    setMoveError("");
+    setArchiving(true);
+    setArchiveError("");
     try {
       await invoke("set_chat_sync_task_archived", { noteId, archived });
       sourceRevision.current++;
@@ -298,38 +273,8 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
       if (returnFocus && (document.activeElement === trigger || document.activeElement === document.body)) {
         archiveToggle.current?.focus({ preventScroll: true });
       }
-    } catch (error) { setMoveError(String(error)); }
-    finally { setMoving(false); }
-  };
-  const statusAt = (x: number, y: number) => {
-    const target = document.elementFromPoint(x, y)?.closest<HTMLElement>(".ci-column[data-status]");
-    if (target && boardRef.current?.contains(target)) return columns.find(({ id }) => id === target.dataset.status)?.id;
-  };
-  const startDrag = (event: PointerEvent<HTMLButtonElement>, noteId: number) => {
-    if (event.button !== 0 || drag.current || moving) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    drag.current = { noteId, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, active: false };
-  };
-  const moveDrag = (event: PointerEvent<HTMLButtonElement>) => {
-    const current = drag.current;
-    if (!current || current.pointerId !== event.pointerId) return;
-    const { clientX: x, clientY: y } = event;
-    if (!current.active && Math.hypot(x - current.startX, y - current.startY) < 6) return;
-    current.active = true;
-    const target = statusAt(x, y);
-    const note = filtered.find(({ note }) => note.id === current.noteId)?.note;
-    if (note) setPreview({ noteId: note.id, x, y, target: target === taskStatus(note) ? undefined : target });
-  };
-  const finishDrag = (event: PointerEvent<HTMLButtonElement>, drop: boolean) => {
-    const current = drag.current;
-    if (!current || current.pointerId !== event.pointerId) return;
-    drag.current = null;
-    setPreview(null);
-    if (!drop || !current.active) return;
-    const target = statusAt(event.clientX, event.clientY);
-    const note = filtered.find(({ note }) => note.id === current.noteId)?.note;
-    if (target && note) void changeStatus(note, target);
+    } catch (error) { setArchiveError(String(error)); }
+    finally { setArchiving(false); }
   };
   const updateProject = (projectId: string, patch: Partial<Pick<CodexProject, "settings" | "hidden">>) => {
     catalogRevision.current++;
@@ -342,6 +287,7 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
       projectId, displayName: settings.displayName ?? "", tracked: settings.tracked
     });
     updateProject(projectId, { settings: saved });
+    if (trackedOnly && !saved.tracked) setProject((current) => current === projectId ? "all" : current);
   };
   const setProjectHidden = async (projectId: string, hidden: boolean) => {
     await invoke("set_chat_sync_project_hidden", { projectId, hidden });
@@ -351,13 +297,18 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
 
   return <section ref={dashboardRef} className="ci-dashboard" aria-label="对话分析看板">
     <div className={`ci-workspace ${!sidebarCollapsed && (catalog || projectError) ? "has-projects" : ""}`}>
-      <aside id="ci-project-sidebar" className="ci-project-rail" aria-label="项目侧边栏" hidden={sidebarCollapsed}>
-        {projectError && <p className="ci-error" role="alert">{projectError}
-          <button type="button" onClick={() => setRefresh((value) => value + 1)}>重新读取项目</button></p>}
-        {catalog && <ConversationProjects projects={registered} counts={counts} descriptions={projectDescriptions}
-          selected={activeProject} trackedOnly={trackedOnly}
-          onSelect={setProject} onTrackedOnly={(enabled) => { setTrackedOnly(enabled); setProject("all"); }}
-          onSave={saveProject} onSetHidden={setProjectHidden} />}
+      <aside id="ci-project-sidebar" className="ci-project-rail" aria-label="项目侧边栏"
+        aria-hidden={sidebarCollapsed || undefined} {...(sidebarCollapsed ? { inert: "" } : {})}>
+        <div className="ci-project-rail-scroll">
+          <div className="ci-project-rail-content">
+            {projectError && <p className="ci-error" role="alert">{projectError}
+              <button type="button" onClick={() => setRefresh((value) => value + 1)}>重新读取项目</button></p>}
+            {catalog && <ConversationProjects projects={registered} counts={counts} descriptions={projectDescriptions}
+              selected={activeProject} trackedOnly={trackedOnly}
+              onSelect={setProject} onTrackedOnly={(enabled) => { setTrackedOnly(enabled); setProject("all"); }}
+              onSave={saveProject} onSetHidden={setProjectHidden} />}
+          </div>
+        </div>
       </aside>
       <section className="ci-actions" aria-label="行动看板">
         {appAlert}
@@ -385,16 +336,11 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
               <strong>{stats.completionRate}%</strong>
             </div>
           </div>}
-          <div className="ci-header-actions">
-            <button className="ci-refresh" type="button" aria-label="刷新对话看板" title="刷新看板" disabled={reading}
-              onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={15} /></button>
-            <button className="ci-sync-settings" type="button" onClick={onOpenSettings}>
-              {sync?.enabled ? "同步设置" : "连接对话"}<ArrowUpRight size={14} />
-            </button>
-          </div>
+          <button className="ci-refresh" type="button" aria-label="刷新对话看板" title="刷新看板" disabled={reading}
+            onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={15} aria-hidden="true" /></button>
         </header>
         {error && <p className="ci-error" role="alert">读取失败：{error}<button type="button" onClick={() => setRefresh((value) => value + 1)}>重试</button></p>}
-        {moveError && <p className="ci-error" role="alert">{moveError}</p>}
+        {archiveError && <p className="ci-error" role="alert">{archiveError}</p>}
         {addFeedback && <p className={addFeedback.error ? "ci-error" : "ci-filter-empty"}
           role={addFeedback.error ? "alert" : "status"}>{addFeedback.message}</p>}
         {showArchived && draft && addError && <p className="ci-error" role="alert">{addError}</p>}
@@ -413,7 +359,7 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
               </div>
               <label className="ci-search"><Search size={15} aria-hidden="true" /><input aria-label="搜索对话事项" placeholder="搜索事项" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
               <button className="ci-archive-toggle" type="button" ref={archiveToggle} onClick={() => {
-                setShowArchived(!showArchived); setMoveError("");
+                setShowArchived(!showArchived); setArchiveError("");
               }}>{showArchived ? <ArrowLeft size={14} aria-hidden="true" /> : <Archive size={14} aria-hidden="true" />}
                 {showArchived ? "返回看板" : `已归档 ${archivedCount}`}</button>
             </div>
@@ -430,11 +376,11 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
             <button type="button" onClick={() => { setSearch(""); setProject("all"); setTrackedOnly(false); setPeriod("all"); setCustomDates(emptyDateRange); }}>清除筛选</button>
           </div>}
           {showArchived && !filtered.length ? (!noMatchingTasks && <div className="ci-empty"><h2>暂无归档事项</h2></div>)
-          : <>
-            <div className="ci-board" ref={boardRef}>{columns.map((column) => {
+          : <div className="ci-board">
+            {columns.map((column) => {
               const items = filtered.filter(({ note }) => taskStatus(note) === column.id);
               const canAdd = !showArchived && column.id === "todo";
-              return <section className={`ci-column ci-${column.id}${preview?.target === column.id ? " drop-target" : ""}`} key={column.id} aria-label={column.label} data-status={column.id}>
+              return <section className={`ci-column ci-${column.id}`} key={column.id} aria-label={column.label} data-status={column.id}>
                 <header><span className="ci-state-dot" /><h3>{column.label}</h3><span className="ci-column-count">{items.length}</span></header>
                 <div className="ci-column-scroll" role="group" aria-label={`${column.label}事项`}
                   tabIndex={items.length > 0 || (canAdd && draft) ? 0 : undefined}>
@@ -448,7 +394,7 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
                       ?? (registeredById.has(projectId) ? projectId : null);
                     const dispatch = evidence.find(({ dispatchThreadId }) => dispatchThreadId);
                     const preferredThreadId = dispatch?.dispatchThreadId ?? evidence.find((source) => source.manual && source.sessionId)?.sessionId ?? evidence.find(({ sessionId }) => sessionId)?.sessionId ?? "";
-                    return <article className={`ci-task${preview?.noteId === note.id ? " dragging" : ""}`} key={note.id}
+                    return <article className="ci-task" key={note.id}
                       onClick={(event) => {
                         const { target, currentTarget } = event;
                         if (!(target instanceof Element) || !currentTarget.contains(target) || target.closest("button, a, .ci-task-dispatch")) return;
@@ -462,7 +408,7 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
                         onClick={(event) => openEditor(note.id, event.currentTarget)}>
                         <strong>{note.title}</strong>{summary && <span className="ci-task-evidence">{summary}</span>}
                       </button>
-                      {(canAdd || Boolean(preferredThreadId)) && <ConversationTaskDispatch noteId={note.id} title={note.title} disabled={moving} canSend={canAdd}
+                      {(canAdd || Boolean(preferredThreadId)) && <ConversationTaskDispatch noteId={note.id} title={note.title} disabled={archiving} canSend={canAdd}
                         projectId={taskProject} projectLabel={taskProject && registeredById.has(taskProject) ? projectOption(taskProject) : undefined}
                         preferredThreadId={preferredThreadId} onSent={onNotesChanged}
                         dispatchState={dispatch?.dispatchState} />}
@@ -470,17 +416,13 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
                         {completedAt && date && time && <time className="ci-task-completed-at" dateTime={completedAt}
                           title={`完成于 ${date} ${time}`}>完成于 {date} {time}</time>}
                         <div className="ci-task-actions">
-                          <button type="button" title={showArchived ? "恢复事项" : "归档事项"} disabled={moving}
+                          <button type="button" title={showArchived ? "恢复事项" : "归档事项"} disabled={archiving}
                             aria-label={`${showArchived ? "恢复事项" : "归档事项"} ${note.title}`}
                             onClick={(event) => void setArchived(note.id, !showArchived, event.currentTarget)}>
                             {showArchived ? <ArchiveRestore size={14} aria-hidden="true" /> : <Archive size={14} aria-hidden="true" />}
                           </button>
                           <button type="button" className="ci-task-edit" title="编辑事项" aria-label={`编辑事项 ${note.title}`} aria-haspopup="dialog"
                             onClick={(event) => openEditor(note.id, event.currentTarget)}><Pencil size={14} aria-hidden="true" /></button>
-                          <button type="button" className="ci-task-drag" aria-label={`拖动事项 ${note.title}`} disabled={moving}
-                            onPointerDown={(event) => startDrag(event, note.id)} onPointerMove={moveDrag}
-                            onPointerUp={(event) => finishDrag(event, true)} onPointerCancel={(event) => finishDrag(event, false)}
-                            onLostPointerCapture={(event) => finishDrag(event, false)}><GripVertical size={15} aria-hidden="true" /></button>
                         </div>
                       </div>
                     </article>;
@@ -523,11 +465,8 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
                   dashboardRef.current?.closest(".app-shell") ?? document.body,
                 )}
               </section>;
-            })}</div>
-            {preview && <span className="ci-drag-preview" aria-hidden="true" style={{ left: preview.x + 12, top: preview.y + 10 }}>
-              {filtered.find(({ note }) => note.id === preview.noteId)?.note.title}
-            </span>}
-          </>}
+            })}
+          </div>}
         </>}
       </section>
     </div>
@@ -548,8 +487,7 @@ export function ConversationDashboard({ notes, categories, repeatSeries, sidebar
             }
           }}>
           <div className="board-detail-heading"><strong>编辑事项</strong></div>
-          <NoteCard key={editing.id} note={editing} categories={categories}
-            repeatSeries={repeatSeries.find(({ id }) => id === editing.repeatSeriesId)}
+          <NoteCard key={editing.id} note={editing} categories={categories} contentOnly
             onEdit={(input) => onEdit(editing.id, input)} onCloseEditor={() => setEditingId(null)}
             editorSupplement={editorSources.length > 0 && <details className="ci-editor-sources">
               <summary>事项依据</summary>

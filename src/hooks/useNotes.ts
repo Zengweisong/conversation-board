@@ -1,7 +1,7 @@
 import { useCallback, useRef } from "react";
 import { useNoteStore } from "../stores/noteStore";
 import * as service from "../services/noteService";
-import type { Note, NoteInput, NoteScheduleSnapshot, NoteUpdate } from "../types/note";
+import type { Note, NoteContentUpdate, NoteInput, NoteScheduleSnapshot, NoteUpdate } from "../types/note";
 import { listRepeatSeries } from "../services/repeatTaskService";
 import { scheduledAtFromParts } from "../services/noteDateService";
 
@@ -78,6 +78,7 @@ export function useNotes(onError: (message: string) => void) {
     notes: store.notes, repeatSeries: store.repeatSeries, loading: store.loading, refresh,
     add: (input: NoteInput) => run(() => service.createNote(input).then(() => undefined)),
     edit: (id: number, input: NoteUpdate) => run(() => service.updateNote(id, input)),
+    editContent: (id: number, input: NoteContentUpdate) => run(() => service.updateNoteContent(id, input)),
     toggleCompleted: (id: number, value: boolean) => run(() => service.setNoteCompleted(id, value)),
     togglePinned: (id: number, value: boolean) => run(() => service.setNotePinned(id, value)),
     toggleRepeatActive: (seriesId: number, value: boolean) => run(() => service.setRepeatActive(seriesId, value)),

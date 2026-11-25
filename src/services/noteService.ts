@@ -1,6 +1,6 @@
 import { getDatabase } from "./database";
 import type { ExportPayloadV2, ExportPayloadV3, Category, CategoryRow } from "../types/category";
-import type { ExportPayloadV1, Note, NoteInput, NotePriority, NoteRow, NoteScheduleSnapshot, NoteUpdate } from "../types/note";
+import type { ExportPayloadV1, Note, NoteContentUpdate, NoteInput, NotePriority, NoteRow, NoteScheduleSnapshot, NoteUpdate } from "../types/note";
 import { listCategories } from "./categoryService";
 import { ReminderService } from "./reminderService";
 import { createRepeatSeries, deleteRepeatSeries, getRepeatSeries, listRepeatSeries, repeatReminderAt, restoreRepeatSeries, setRepeatSeriesActive, stopRepeatSeries, updateRepeatSeries, withRepeatSeriesMutation } from "./repeatTaskService";
@@ -122,6 +122,16 @@ export async function createNote(input: NoteInput): Promise<Note> {
     console.error("添加事项失败:", error);
     throw error instanceof Error ? error : new Error("添加事项失败");
   }
+}
+
+export async function updateNoteContent(id: number, input: NoteContentUpdate): Promise<void> {
+  const title = input.title.trim();
+  if (!title) throw new Error("事项标题不能为空");
+  const result = await (await getDatabase()).execute(
+    "UPDATE notes SET content = $1, title = $1, details = $2, updated_at = $3 WHERE id = $4",
+    [title, input.details?.trim() || null, new Date().toISOString(), id]
+  );
+  if (!result.rowsAffected) throw new Error("事项不存在");
 }
 
 export function updateNote(id: number, input: NoteUpdate): Promise<void> {

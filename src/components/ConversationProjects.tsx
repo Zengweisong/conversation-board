@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, FolderClosed, Layers3, Pencil, RotateCcw, Star, X } from "lucide-react";
+import { ChevronDown, Layers3, Pencil, Plus, RotateCcw, Star, X } from "lucide-react";
 import type { CodexProject, ProjectSettings } from "../services/chatInsightsService";
+import { SelectField } from "./SelectField";
 
 interface Props {
   projects: CodexProject[];
@@ -20,12 +21,38 @@ export function ConversationProjects({ projects, counts, descriptions, selected,
   const [error, setError] = useState("");
   const [lastRemoved, setLastRemoved] = useState<string | null>(null);
   const undoButton = useRef<HTMLButtonElement>(null);
+  const allProjectsButton = useRef<HTMLButtonElement>(null);
   useEffect(() => { if (lastRemoved) undoButton.current?.focus({ preventScroll: true }); }, [lastRemoved]);
   const active = projects.filter(({ hidden }) => !hidden);
   const removed = projects.filter(({ hidden }) => hidden);
   const undoTarget = removed.find(({ id }) => id === lastRemoved);
   const target = active.find(({ id }) => id === editing?.id);
   const visible = active.filter(({ settings }) => !trackedOnly || settings.tracked);
+  const untracked = active.filter(({ settings }) => !settings.tracked);
+  async function saveSettings(id: string, settings: ProjectSettings) {
+    if (saving) return false;
+    setSaving(true);
+    setError("");
+    try {
+      await onSave(id, settings);
+      return true;
+    } catch (error) {
+      setError(String(error));
+      return false;
+    } finally { setSaving(false); }
+  }
+  async function toggleTracking(id: string) {
+    const project = active.find((item) => item.id === id);
+    if (!project) return;
+    const tracked = !project.settings.tracked;
+    const trigger = document.activeElement;
+    if (!await saveSettings(id, { ...project.settings, tracked })) return;
+    setEditing((current) => current?.id === id ? { ...current, tracked } : current);
+    if (trackedOnly && (!tracked || untracked.length === 1) && trigger instanceof HTMLButtonElement
+      && (document.activeElement === trigger || document.activeElement === document.body)) {
+      allProjectsButton.current?.focus({ preventScroll: true });
+    }
+  }
   async function changeVisibility(id: string, hidden: boolean) {
     if (saving) return;
     setSaving(true);
@@ -48,13 +75,17 @@ export function ConversationProjects({ projects, counts, descriptions, selected,
       <button type="button" ref={undoButton} disabled={saving}
         onClick={() => void changeVisibility(undoTarget.id, false)}>撤销</button>
     </div>}
-    <button type="button" className="ci-project-all" aria-pressed={selected === "all"}
+    <button type="button" className="ci-project-all" ref={allProjectsButton} aria-pressed={selected === "all"}
       onClick={() => onSelect("all")}><Layers3 size={14} aria-hidden="true" />{trackedOnly ? "追踪的项目" : "所有项目"}</button>
     <ul className="ci-project-list">
       {visible.map(({ id, name, rootPaths, settings }) => {
         const label = settings.displayName ?? name;
         const description = descriptions.get(id);
+        const accessibleLabel = description ? `${label} · ${description}` : label;
         return <li key={id} className={selected === id ? "selected" : ""}>
+          <button type="button" className="ci-project-track" title={settings.tracked ? "取消追踪" : "添加追踪"}
+            aria-label={`追踪项目 ${accessibleLabel}`} aria-pressed={settings.tracked} aria-disabled={saving || undefined}
+            onClick={() => void toggleTracking(id)}><Star size={14} aria-hidden="true" /></button>
           <button type="button" className="ci-project-select" aria-pressed={selected === id}
             aria-keyshortcuts="Delete" title={description ?? (rootPaths.join("\n") || name)}
             onClick={() => onSelect(selected === id ? "all" : id)}
@@ -63,27 +94,32 @@ export function ConversationProjects({ projects, counts, descriptions, selected,
               event.preventDefault();
               void changeVisibility(id, true);
             }}>
-            <span className="ci-project-icon">{settings.tracked
-              ? <Star size={14} className="ci-tracked-star" aria-label="已追踪" />
-              : <FolderClosed size={14} aria-hidden="true" />}</span>
             <span className="ci-project-label">{label}</span>
             <small>{counts.get(id) ?? 0} 项</small>
           </button>
           <div className="ci-project-row-actions">
             <button type="button" className="ci-project-edit" title="编辑项目"
-              aria-label={`编辑项目 ${label}${description ? ` · ${description}` : ""}`} disabled={saving}
+              aria-label={`编辑项目 ${accessibleLabel}`} disabled={saving}
               onClick={() => {
                 setError("");
                 setEditing({ id, displayName: settings.displayName ?? "", tracked: settings.tracked });
               }}><Pencil size={13} /></button>
             <button type="button" className="ci-project-remove" title="移出看板"
-              aria-label={`移出看板 ${label}${description ? ` · ${description}` : ""}`} disabled={saving}
+              aria-label={`移出看板 ${accessibleLabel}`} disabled={saving}
               onClick={() => void changeVisibility(id, true)}><X size={15} /></button>
           </div>
         </li>;
       })}
     </ul>
     {!visible.length && <p className="ci-project-empty">{trackedOnly ? "暂无追踪项目" : "看板暂无项目"}</p>}
+    {trackedOnly && untracked.length > 0 && <div className="ci-project-track-picker">
+      <SelectField label="添加追踪项目" placeholder="添加追踪项目" variant="toolbar" value={null} disabled={saving}
+        leadingIcon={<Plus size={14} />}
+        options={untracked.map(({ id, name, settings }) => ({
+          value: id, label: `${settings.displayName ?? name}${descriptions.has(id) ? ` · ${descriptions.get(id)}` : ""}`
+        }))}
+        onChange={(id) => void toggleTracking(id)} />
+    </div>}
     {removed.length > 0 && <details className="ci-removed-projects">
       <summary><ChevronDown size={14} aria-hidden="true" />已移除 <span>{removed.length}</span></summary>
       <ul>{removed.map(({ id, name, rootPaths, settings }) => {
@@ -99,14 +135,7 @@ export function ConversationProjects({ projects, counts, descriptions, selected,
     {error && <p role="alert" className="ci-error">{error}</p>}
     {editing && target && <form className="ci-project-form" key={editing.id} aria-label={`编辑项目 ${target.name}`} onSubmit={async (event) => {
       event.preventDefault();
-      if (saving) return;
-      setSaving(true);
-      setError("");
-      try {
-        await onSave(editing.id, { displayName: editing.displayName.trim() || null, tracked: editing.tracked });
-        setEditing(null);
-      } catch (error) { setError(String(error)); }
-      finally { setSaving(false); }
+      if (await saveSettings(editing.id, { displayName: editing.displayName.trim() || null, tracked: editing.tracked })) setEditing(null);
     }}>
       <strong title={descriptions.get(target.id) ?? (target.rootPaths.join("\n") || undefined)}>编辑 {target.name}</strong>
       <label className="ci-project-name-field">显示名

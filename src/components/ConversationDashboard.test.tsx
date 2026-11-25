@@ -21,32 +21,27 @@ const enterTaskContent = (form: HTMLFormElement, content: string) => act(async (
   Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(field, content);
   field.dispatchEvent(new Event("input", { bubbles: true }));
 });
-async function render(readManualNotes: () => Note[] = () => []) {
+async function render(readManualNotes: () => Note[] = () => [], completedAt: string | null = null) {
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
-  const onOpenSettings = vi.fn(); const onStatusChange = vi.fn().mockResolvedValue(true);
   const onEdit = vi.fn().mockResolvedValue(true);
+  let setSidebarCollapsed!: (collapsed: boolean) => void;
   const initialNotes = [insightNote(1, { title: "整理接口文档" }), insightNote(2, { title: "登录功能", status: "doing" }),
-    insightNote(3, { title: "看板设计", completed: true, status: "completed" }), insightNote(4, { title: "手动事项" })];
+    insightNote(3, { title: "看板设计", completed: true, status: "completed", completedAt }),
+    insightNote(4, { title: "手动事项" })];
   function Dashboard() {
     const [notes, setNotes] = useState(() => [...initialNotes, ...readManualNotes()]);
-    return <ConversationDashboard notes={notes} categories={[]} repeatSeries={[]} onOpenSettings={onOpenSettings}
+    const [sidebarCollapsed, setCollapsed] = useState(false);
+    setSidebarCollapsed = setCollapsed;
+    return <ConversationDashboard notes={notes} categories={[]} sidebarCollapsed={sidebarCollapsed}
       onNotesChanged={async () => setNotes([...initialNotes, ...readManualNotes()])}
       onEdit={async (id, input) => {
         const saved = await onEdit(id, input);
         if (saved) setNotes((current) => current.map((note) => note.id === id ? { ...note, title: input.title, details: input.details ?? null } : note));
         return saved;
-      }} onStatusChange={async (note, status) => {
-      const changed = await onStatusChange(note, status);
-      if (changed) {
-        const completed = status === "completed";
-        const completedAt = completed ? new Date().toISOString() : null;
-        setNotes((current) => current.map((item) => item.id === note.id ? { ...item, status, completed, completedAt } : item));
-      }
-      return changed;
-    }} />;
+      }} />;
   }
   await act(async () => root.render(<Dashboard />));
-  return { onOpenSettings, onStatusChange, onEdit };
+  return { onEdit, setSidebarCollapsed };
 }
 function mockRecords(duplicateNames = false) {
   const archived = new Set<number>();
@@ -105,6 +100,66 @@ it("lists projects with zero tasks, saves editable project settings, and filters
   await act(async () => container.querySelector<HTMLButtonElement>(".ci-project-filter")!.click());
   expect(projectButtons()).toHaveLength(2);
   expect(container.querySelectorAll(".ci-task")).toHaveLength(3);
+});
+it("keeps the sidebar mounted for the transition while blocking interaction when collapsed", async () => {
+  mockRecords(); const { setSidebarCollapsed } = await render();
+  const sidebar = container.querySelector<HTMLElement>("#ci-project-sidebar")!;
+  const workspace = sidebar.parentElement!;
+  const project = sidebar.querySelector<HTMLButtonElement>(".ci-project-select")!;
+  await act(async () => project.click());
+  expect(project.getAttribute("aria-pressed")).toBe("true");
+
+  await act(async () => setSidebarCollapsed(true));
+  expect(workspace.classList.contains("has-projects")).toBe(false);
+  expect(sidebar.hidden).toBe(false);
+  expect(sidebar.hasAttribute("inert")).toBe(true);
+  expect(sidebar.getAttribute("aria-hidden")).toBe("true");
+  expect(sidebar.contains(project)).toBe(true);
+  expect(filterTrigger("项目筛选").textContent).toBe("开发工具");
+
+  await act(async () => setSidebarCollapsed(false));
+  expect(workspace.classList.contains("has-projects")).toBe(true);
+  expect(sidebar.hasAttribute("inert")).toBe(false);
+  expect(sidebar.hasAttribute("aria-hidden")).toBe(false);
+  expect(project.getAttribute("aria-pressed")).toBe("true");
+});
+it("tracks a project from its row and adds another directly from the tracked view", async () => {
+  mockRecords(); await render();
+  const star = container.querySelector<HTMLButtonElement>('[aria-label="追踪项目 开发工具"]')!;
+  const filter = container.querySelector<HTMLButtonElement>(".ci-project-filter")!;
+  const toggle = container.querySelector<HTMLButtonElement>(".ci-project-all")!;
+  expect(star.getAttribute("aria-pressed")).toBe("false");
+
+  vi.mocked(invoke).mockRejectedValueOnce(new Error("保存失败"));
+  await act(async () => star.click());
+  expect(container.querySelector(".ci-projects [role=alert]")?.textContent).toContain("保存失败");
+  expect(star.getAttribute("aria-pressed")).toBe("false");
+  await act(async () => star.click());
+  expect(invoke).toHaveBeenLastCalledWith("save_chat_sync_project", { projectId: "app", displayName: "", tracked: true });
+  expect(star.getAttribute("aria-pressed")).toBe("true");
+  expect(container.querySelector(".ci-projects [role=alert]")).toBeNull();
+
+  await act(async () => filter.click());
+  expect(container.querySelectorAll(".ci-project-select")).toHaveLength(1);
+  const add = filterTrigger("添加追踪项目");
+  await act(async () => add.click());
+  const [option] = filterOptions(add);
+  expect(option.textContent).toBe("还没有事项的项目");
+  await act(async () => option.click());
+  expect(invoke).toHaveBeenLastCalledWith("save_chat_sync_project", { projectId: "empty", displayName: "", tracked: true });
+  expect(container.querySelectorAll(".ci-project-select")).toHaveLength(2);
+  expect(filterTrigger("添加追踪项目")).toBeNull();
+  expect(document.activeElement).toBe(toggle);
+
+  const row = star.closest("li")!;
+  await act(async () => row.querySelector<HTMLButtonElement>(".ci-project-select")!.click());
+  star.focus();
+  await act(async () => star.click());
+  expect(invoke).toHaveBeenLastCalledWith("save_chat_sync_project", { projectId: "app", displayName: "", tracked: false });
+  expect(row.isConnected).toBe(false);
+  expect(toggle.getAttribute("aria-pressed")).toBe("true");
+  expect(document.activeElement).toBe(toggle);
+  expect(filterTrigger("添加追踪项目")).toBeTruthy();
 });
 it("distinguishes separate Codex project IDs even when name and path match", async () => {
   mockRecords(true); await render();
@@ -184,7 +239,7 @@ it("opens the editor from the card surface and provides its synced evidence", as
   expect(document.activeElement).toBe(card.querySelector(".ci-task-open"));
 });
 it("archives a completed card, keeps it archived after reopening the board, and restores it", async () => {
-  mockRecords(); const { onStatusChange } = await render();
+  mockRecords(); await render();
   const archive = () => container.querySelector<HTMLButtonElement>('[aria-label="归档事项 看板设计"]');
   const archiveView = () => container.querySelector<HTMLButtonElement>(".ci-archive-toggle")!;
   vi.mocked(invoke).mockRejectedValueOnce("保存归档失败");
@@ -198,7 +253,6 @@ it("archives a completed card, keeps it archived after reopening the board, and 
   expect(archive()).toBeNull();
   expect(archiveView().textContent).toBe("已归档 1");
   expect(document.activeElement).toBe(archiveView());
-  expect(onStatusChange).not.toHaveBeenCalled();
 
   await act(async () => root.unmount());
   container.remove();
@@ -533,79 +587,16 @@ it("filters with preset and inclusive custom sync dates and resets project count
   expect(picker.textContent).toBe("全部日期");
   expect(titles()).toHaveLength(3);
 });
-it("drags a card into an empty column and cancels interrupted or outside drops", async () => {
-  vi.useFakeTimers();
-  const completionTime = new Date(2026, 10, 19, 14, 5);
-  vi.setSystemTime(completionTime);
-  mockRecords();
-  const { onStatusChange } = await render();
-  const findHandle = () => container.querySelector<HTMLButtonElement>('[aria-label="拖动事项 整理接口文档"]')!;
-  let handle = findHandle();
-  const target = container.querySelector<HTMLElement>('[data-status="doing"]')!;
-  const savedHitTest = Object.getOwnPropertyDescriptor(document, "elementFromPoint");
-  let hit: HTMLElement = target.querySelector("h3")!;
-  Object.defineProperty(document, "elementFromPoint", { configurable: true, value: () => hit });
-  const capture = vi.fn();
-  Object.defineProperty(handle, "setPointerCapture", { value: capture });
-  const pointer = (type: string, x: number) => {
-    const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, clientX: x, clientY: 10 });
-    Object.defineProperty(event, "pointerId", { value: 1 });
-    handle.dispatchEvent(event);
-  };
-  const drop = async () => {
-    await act(async () => { pointer("pointerdown", 0); pointer("pointermove", 20); pointer("pointerup", 20); });
-    handle = findHandle();
-    Object.defineProperty(handle, "setPointerCapture", { value: capture });
-  };
-  try {
-    await act(async () => handle.click());
-    expect(document.querySelector(".ci-editor-dialog")).toBeNull();
-    await act(async () => { pointer("pointerdown", 0); pointer("pointermove", 4); pointer("pointerup", 4); });
-    expect(onStatusChange).not.toHaveBeenCalled();
-    await act(async () => { pointer("pointerdown", 0); pointer("pointermove", 20); });
-    expect(capture).toHaveBeenCalledWith(1);
-    expect(target.classList.contains("drop-target")).toBe(true);
-    await act(async () => pointer("pointercancel", 20));
-    expect(onStatusChange).not.toHaveBeenCalled();
-    expect(container.querySelector(".ci-drag-preview")).toBeNull();
-
-    await act(async () => { pointer("pointerdown", 0); pointer("pointermove", 20); });
-    hit = container;
-    await act(async () => pointer("pointerup", 30));
-    expect(onStatusChange).not.toHaveBeenCalled();
-
-    // The board initially has a card in every column. Filter down to the task being dragged.
-    const search = container.querySelector<HTMLInputElement>('[aria-label="搜索对话事项"]')!;
-    await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(search, "整理接口文档");
-      search.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    hit = target.querySelector(".ci-column-empty")!;
-    expect(hit).toBeTruthy();
-    onStatusChange.mockResolvedValueOnce(false);
-    await drop();
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("事项状态未保存");
-    expect(container.querySelector(".ci-todo")?.contains(handle)).toBe(true);
-    expect(onStatusChange).toHaveBeenCalledTimes(1);
-    await drop();
-    expect(onStatusChange).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }), "doing");
-    expect(target.textContent).toContain("整理接口文档");
-    expect(document.querySelector(".ci-editor-dialog")).toBeNull();
-
-    hit = container.querySelector<HTMLElement>('[data-status="completed"]')!;
-    await drop();
-    expect(onStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ id: 1 }), "completed");
-    const recordedTime = container.querySelector<HTMLTimeElement>(".ci-completed .ci-task time");
-    expect(recordedTime?.dateTime).toBe(completionTime.toISOString());
-    expect(recordedTime?.textContent).toBe("完成于 2026-11-19 14:05");
-
-    hit = container.querySelector<HTMLElement>('[data-status="todo"]')!;
-    await drop();
-    expect(container.querySelector(".ci-task time")).toBeNull();
-  } finally {
-    if (savedHitTest) Object.defineProperty(document, "elementFromPoint", savedHitTest);
-    else Reflect.deleteProperty(document, "elementFromPoint");
-  }
+it("shows tasks by status without drag controls", async () => {
+  const completedAt = new Date(2026, 10, 19, 14, 5).toISOString();
+  mockRecords(); await render(undefined, completedAt);
+  expect(container.querySelector(".ci-todo .ci-task-open strong")?.textContent).toBe("整理接口文档");
+  expect(container.querySelector(".ci-doing .ci-task-open strong")?.textContent).toBe("登录功能");
+  expect(container.querySelector(".ci-completed .ci-task-open strong")?.textContent).toBe("看板设计");
+  const completion = container.querySelector<HTMLTimeElement>(".ci-completed .ci-task time");
+  expect(completion?.dateTime).toBe(completedAt);
+  expect(completion?.textContent).toBe("完成于 2026-11-19 14:05");
+  expect(container.querySelector('.ci-task [aria-label^="拖动事项"]')).toBeNull();
 });
 it("filters tasks by text and provides a reset when nothing matches", async () => {
   mockRecords(); await render();
@@ -619,14 +610,16 @@ it("filters tasks by text and provides a reset when nothing matches", async () =
   await act(async () => [...container.querySelectorAll("button")].find((button) => button.textContent === "清除筛选")!.click());
   expect(container.querySelectorAll(".ci-task")).toHaveLength(3);
 });
-it("edits a completed item in place and keeps its status and conversation evidence", async () => {
-  mockRecords(); const { onEdit, onStatusChange } = await render();
+it("only edits the title and notes of a completed item and keeps its status and evidence", async () => {
+  mockRecords(); const { onEdit } = await render();
   const edit = container.querySelector<HTMLButtonElement>('[aria-label="编辑事项 看板设计"]')!;
   await act(async () => edit.click());
   const dialog = document.querySelector<HTMLElement>('[role="dialog"][aria-label="编辑事项"]')!;
   const title = dialog.querySelector<HTMLTextAreaElement>('[aria-label="事项标题"]')!;
   expect(title.value).toBe("看板设计");
   expect(document.activeElement).toBe(title);
+  expect(dialog.querySelector(".markdown-editor-toolbar")?.textContent).toBe("备注");
+  expect(dialog.textContent).not.toMatch(/所属分类|优先级|事项时间|重复方式|编辑范围|提醒/);
   await act(async () => {
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(title, "完成看板设计评审");
     title.dispatchEvent(new Event("input", { bubbles: true }));
@@ -637,8 +630,7 @@ it("edits a completed item in place and keeps its status and conversation eviden
   expect(dialog.querySelector('[role="alert"]')?.textContent).toContain("保存失败");
   expect(title.value).toBe("完成看板设计评审");
   await act(async () => save.click());
-  expect(onEdit).toHaveBeenLastCalledWith(3, expect.objectContaining({ title: "完成看板设计评审" }));
-  expect(onStatusChange).not.toHaveBeenCalled();
+  expect(onEdit).toHaveBeenLastCalledWith(3, { title: "完成看板设计评审", details: "" });
   expect(document.querySelector(".ci-editor-dialog")).toBeNull();
   expect(document.activeElement).toBe(edit);
 

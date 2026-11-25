@@ -11,6 +11,7 @@ interface Props<T extends SelectValue> {
   id?: string;
   label: string;
   value: T | null;
+  placeholder?: string;
   options: readonly SelectOption<T>[];
   onChange: (value: T) => void;
   leadingIcon?: ReactNode;
@@ -19,7 +20,7 @@ interface Props<T extends SelectValue> {
   title?: string;
 }
 
-export function SelectField<const T extends SelectValue>({ id, label, value, options, onChange, leadingIcon, variant, disabled, title }: Props<T>) {
+export function SelectField<const T extends SelectValue>({ id, label, value, placeholder = "请选择", options, onChange, leadingIcon, variant, disabled, title }: Props<T>) {
   const listId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const search = useRef({ text: "", at: 0 });
@@ -113,7 +114,7 @@ export function SelectField<const T extends SelectValue>({ id, label, value, opt
       {leadingIcon && <span className="select-field-icon" aria-hidden="true">{leadingIcon}</span>}
       <span className="select-field-value">
         {selection?.swatch && <span className="select-field-swatch" style={{ backgroundColor: selection.swatch }} aria-hidden="true" />}
-        <span>{selection?.label ?? "请选择"}</span>
+        <span>{selection?.label ?? placeholder}</span>
       </span>
       <ChevronDown size={14} aria-hidden="true" />
     </button>

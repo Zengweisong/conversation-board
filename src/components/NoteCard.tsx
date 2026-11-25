@@ -29,6 +29,7 @@ interface Props {
   onRequestDelete?: () => void;
   onCloseEditor?: () => void;
   editorSupplement?: ReactNode;
+  contentOnly?: boolean;
   startEditing?: boolean;
   minimal?: boolean;
   /** Calendar-only projected occurrence. It edits the series without creating a database row. */
@@ -36,7 +37,8 @@ interface Props {
 }
 
 export function NoteCard({ note, repeatSeries, categories, isNew, dragging, dragOffsetY = 0, dropPosition, onPointerDown, onPointerMove, onPointerUp, onPointerCancel,
-  onToggleCompleted, onTogglePinned, onToggleRepeatActive, onEdit, onRequestDelete, onCloseEditor, editorSupplement, startEditing = false, minimal = false, virtualOccurrence = false }: Props) {
+  onToggleCompleted, onTogglePinned, onToggleRepeatActive, onEdit, onRequestDelete, onCloseEditor, editorSupplement,
+  contentOnly = false, startEditing = false, minimal = false, virtualOccurrence = false }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState(startEditing || Boolean(onCloseEditor));
   const [title, setTitle] = useState(note.title);
@@ -48,7 +50,7 @@ export function NoteCard({ note, repeatSeries, categories, isNew, dragging, drag
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [reminderClock, setReminderClock] = useState(0);
-  const reminderVisible = isUpcomingReminder(note);
+  const reminderVisible = !contentOnly && isUpcomingReminder(note);
   const editorRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef<HTMLTextAreaElement>(null);
   const contentRef = useRef<HTMLParagraphElement>(null);
@@ -94,7 +96,8 @@ export function NoteCard({ note, repeatSeries, categories, isNew, dragging, drag
     setBusy(true);
     setSaveError("");
     try {
-      const saved = await onEdit({ ...schedule, title, details, categoryId, priority,
+      const content = { title, details };
+      const saved = await onEdit(contentOnly ? content : { ...schedule, ...content, categoryId, priority,
         repeatEditScope: virtualOccurrence ? "series" : schedule.repeatEditScope });
       if (saved) {
         if (onCloseEditor) onCloseEditor();
@@ -148,7 +151,7 @@ export function NoteCard({ note, repeatSeries, categories, isNew, dragging, drag
           onChange={(event) => setTitle(event.target.value)} onKeyDown={handleEditorKey} />
         <div className="markdown-editor">
           <div className="markdown-editor-toolbar">
-            <span>详细备注</span><small>Markdown · 实时预览</small>
+            <span>{contentOnly ? "备注" : "详细备注"}</span>{!contentOnly && <small>Markdown · 实时预览</small>}
           </div>
           <Suspense fallback={<div className="markdown-editor-loading" role="status">正在加载编辑器…</div>}>
             <MarkdownEditor value={details} disabled={busy} onChange={setDetails} onCancel={cancel}
@@ -156,24 +159,26 @@ export function NoteCard({ note, repeatSeries, categories, isNew, dragging, drag
           </Suspense>
         </div>
         {editorSupplement}
-        <div className="edit-section-title">分类与优先级</div>
-        <div className="note-edit-fields">
-          <div className="note-edit-field"><span>所属分类</span>
-            <SelectField label="所属类别" value={categoryId ?? categories.find((category) => category.isSystem)?.id ?? null}
-              options={categories.map((item) => ({ value: item.id, label: item.name }))} onChange={setCategoryId} />
+        {!contentOnly && <>
+          <div className="edit-section-title">分类与优先级</div>
+          <div className="note-edit-fields">
+            <div className="note-edit-field"><span>所属分类</span>
+              <SelectField label="所属类别" value={categoryId ?? categories.find((category) => category.isSystem)?.id ?? null}
+                options={categories.map((item) => ({ value: item.id, label: item.name }))} onChange={setCategoryId} />
+            </div>
+            <div className="note-edit-field"><span>优先级</span>
+              <SelectField label="优先级" value={priority} onChange={setPriority}
+                options={[{ value: "low", label: "低优先级" }, { value: "normal", label: "普通" }, { value: "high", label: "高优先级" }]} />
+            </div>
           </div>
-          <div className="note-edit-field"><span>优先级</span>
-            <SelectField label="优先级" value={priority} onChange={setPriority}
-              options={[{ value: "low", label: "低优先级" }, { value: "normal", label: "普通" }, { value: "high", label: "高优先级" }]} />
-          </div>
-        </div>
-        {repeatSeries && !virtualOccurrence && <div className="repeat-edit-scope"><span>编辑范围</span>
-          <SelectField label="编辑范围" value={schedule.repeatEditScope || "occurrence"}
-            options={[{ value: "occurrence", label: "仅修改本次" }, { value: "series", label: "修改整个系列" }]}
-            onChange={(repeatEditScope) => setSchedule((current) => ({ ...current, repeatEditScope }))} />
-        </div>}
-        {repeatSeries && virtualOccurrence && <div className="virtual-occurrence-note">这是尚未生成的重复实例，修改将应用到整个系列。</div>}
-        <TaskScheduleFields value={{ ...schedule, title }} onChange={(patch) => setSchedule((current) => ({ ...current, ...patch }))} compact />
+          {repeatSeries && !virtualOccurrence && <div className="repeat-edit-scope"><span>编辑范围</span>
+            <SelectField label="编辑范围" value={schedule.repeatEditScope || "occurrence"}
+              options={[{ value: "occurrence", label: "仅修改本次" }, { value: "series", label: "修改整个系列" }]}
+              onChange={(repeatEditScope) => setSchedule((current) => ({ ...current, repeatEditScope }))} />
+          </div>}
+          {repeatSeries && virtualOccurrence && <div className="virtual-occurrence-note">这是尚未生成的重复实例，修改将应用到整个系列。</div>}
+          <TaskScheduleFields value={{ ...schedule, title }} onChange={(patch) => setSchedule((current) => ({ ...current, ...patch }))} compact />
+        </>}
         {saveError && <div className="note-edit-error" role="alert">{saveError}</div>}
         <div className="note-edit-actions"><span>Enter 保存 · Esc 取消</span><button disabled={busy} onClick={cancel}>取消</button><button disabled={busy} onClick={() => void save()}>{busy ? "保存中…" : "保存"}</button></div>
       </div> : <>

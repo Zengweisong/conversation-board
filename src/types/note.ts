@@ -100,6 +100,8 @@ export interface NoteInput {
 
 export interface NoteUpdate extends NoteInput {}
 
+export type NoteContentUpdate = Pick<NoteUpdate, "title" | "details">;
+
 export interface ExportNote extends Omit<Note, "id"> { id?: number }
 
 export interface ExportPayloadV1 {
