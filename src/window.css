@@ -229,7 +229,14 @@
   border-radius: 50%;
   background: #171b20b3;
 }
-.ci-theme-color-saved > span { display: block; color: var(--muted); font-size: var(--font-xs); }
+.ci-theme-saved-header, .ci-theme-saved-actions { display: flex; align-items: center; gap: 8px; }
+.ci-theme-saved-header > span, .ci-theme-saved-actions > span {
+  margin-inline-end: auto;
+  color: var(--muted);
+  font-size: var(--font-xs);
+}
+.ci-theme-saved-actions { margin-top: 6px; }
+.ci-theme-saved-actions > span { font-variant-numeric: tabular-nums; }
 .ci-theme-color-saved .ci-theme-color-swatches {
   max-block-size: 120px;
   margin: 4px -4px 0;
@@ -283,7 +290,7 @@
   align-items: center;
   gap: 8px;
 }
-.ci-theme-color-actions button {
+.ci-theme-color-actions button, .ci-theme-saved-header button, .ci-theme-saved-actions button {
   min-height: 30px;
   padding: 4px 9px;
   border: 0;
@@ -293,6 +300,15 @@
   font: inherit;
   font-size: var(--font-xs);
   cursor: pointer;
+}
+.ci-theme-saved-header button, .ci-theme-saved-actions button { display: inline-flex; align-items: center; gap: 4px; }
+.ci-theme-saved-header button:hover:not(:disabled), .ci-theme-saved-actions button:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+.ci-theme-saved-actions .ci-theme-delete-color:hover:not(:disabled) {
+  background: color-mix(in srgb, #d96469 18%, transparent);
+  color: var(--text);
 }
 .ci-theme-color-actions button:first-child:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent-strong); }
 .ci-theme-color-actions button:last-child { min-width: 68px; background: var(--accent-strong); color: rgb(var(--panel-rgb)); font-weight: 650; }

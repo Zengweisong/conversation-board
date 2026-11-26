@@ -29,6 +29,7 @@ function ConversationBoardApp() {
   const [themeBusy, setThemeBusy] = useState(false);
   const [themeError, setThemeError] = useState("");
   const [themeColorDraft, setThemeColorDraft] = useState<string | null>();
+  const [settingsSession, setSettingsSession] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
   const [closeError, setCloseError] = useState("");
@@ -145,6 +146,7 @@ function ConversationBoardApp() {
     setThemeError("");
     setThemeColorDraft(undefined);
     setCloseSettingsError("");
+    setSettingsSession((session) => session + 1);
     settings.current?.showModal();
   };
   const sidebarAction = sidebarCollapsed ? "展开侧边栏" : "收起侧边栏";
@@ -176,6 +178,18 @@ function ConversationBoardApp() {
       || await updateAppearance({ darkMode, themeColor: color, savedThemeColors: colors })) {
       setThemeColorDraft(undefined);
     }
+  }
+
+  async function updateSavedTheme(original: string, replacement: string | null) {
+    if (!savedThemeColors.includes(original)) return false;
+    const colors = replacement === null
+      ? savedThemeColors.filter((color) => color !== original)
+      : [...new Set(savedThemeColors.map((color) => color === original ? replacement : color))];
+    const saved = await updateAppearance({
+      darkMode, themeColor: savedColor === original ? replacement : savedColor, savedThemeColors: colors
+    });
+    if (saved && (replacement !== null || savedColor === original)) setThemeColorDraft(undefined);
+    return saved;
   }
 
   async function changeCloseAction(action: CloseAction) {
@@ -235,9 +249,11 @@ function ConversationBoardApp() {
             aria-checked={darkMode} disabled={themeBusy}
             onClick={() => void updateAppearance({ darkMode: !darkMode, themeColor: savedColor, savedThemeColors })}><span /></button>
         </div>
-        <ThemeColorPicker color={themeColor} savedColor={savedColor}
+        <ThemeColorPicker key={settingsSession} color={themeColor} savedColor={savedColor}
           savedThemeColors={savedThemeColors} busy={themeBusy} onPreview={setThemeColorDraft}
-          onSave={() => void applyThemeColor(themeColor)} onUseSaved={(color) => void applyThemeColor(color)} />
+          onCancelPreview={() => setThemeColorDraft(undefined)}
+          onSave={() => void applyThemeColor(themeColor)} onUseSaved={(color) => void applyThemeColor(color)}
+          onUpdateSaved={updateSavedTheme} />
         {themeError && <p className="chat-sync-error" role="alert">{themeError}</p>}
       </div>
       <ChatSyncSettings />

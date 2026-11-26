@@ -614,7 +614,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "conversation-board"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "reqwest",
