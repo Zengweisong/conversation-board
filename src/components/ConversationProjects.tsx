@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, Layers3, Pencil, Plus, RotateCcw, Star, X } from "lucide-react";
 import type { CodexProject, ProjectSettings } from "../services/chatInsightsService";
 import { SelectField } from "./SelectField";
@@ -20,15 +20,26 @@ export function ConversationProjects({ projects, counts, descriptions, selected,
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [lastRemoved, setLastRemoved] = useState<string | null>(null);
+  const [showUndo, setShowUndo] = useState(false);
   const undoButton = useRef<HTMLButtonElement>(null);
   const allProjectsButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => { if (lastRemoved) undoButton.current?.focus({ preventScroll: true }); }, [lastRemoved]);
   const active = projects.filter(({ hidden }) => !hidden);
   const removed = projects.filter(({ hidden }) => hidden);
   const undoTarget = removed.find(({ id }) => id === lastRemoved);
+  const undoTargetId = undoTarget?.id;
   const target = active.find(({ id }) => id === editing?.id);
   const visible = active.filter(({ settings }) => !trackedOnly || settings.tracked);
   const untracked = active.filter(({ settings }) => !settings.tracked);
+
+  useEffect(() => {
+    if (!showUndo || !undoTargetId) return;
+    undoButton.current?.focus({ preventScroll: true });
+    const timer = window.setTimeout(() => {
+      if (document.activeElement === undoButton.current) allProjectsButton.current?.focus({ preventScroll: true });
+      setShowUndo(false);
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [showUndo, undoTargetId]);
   async function saveSettings(id: string, settings: ProjectSettings) {
     if (saving) return false;
     setSaving(true);
@@ -53,26 +64,48 @@ export function ConversationProjects({ projects, counts, descriptions, selected,
       allProjectsButton.current?.focus({ preventScroll: true });
     }
   }
-  async function changeVisibility(id: string, hidden: boolean) {
+  const changeVisibility = useCallback(async (id: string, hidden: boolean) => {
     if (saving) return;
     setSaving(true);
     setError("");
     try {
       await onSetHidden(id, hidden);
-      if (editing?.id === id) setEditing(null);
-      if (hidden || lastRemoved === id) setLastRemoved(hidden ? id : null);
+      setEditing((current) => current?.id === id ? null : current);
+      if (hidden) {
+        setLastRemoved(id);
+        setShowUndo(true);
+      } else {
+        if (document.activeElement === undoButton.current) allProjectsButton.current?.focus({ preventScroll: true });
+        setLastRemoved((current) => current === id ? null : current);
+      }
     } catch (error) { setError(String(error)); }
     finally { setSaving(false); }
-  }
+  }, [onSetHidden, saving]);
+
+  useEffect(() => {
+    if (!undoTargetId || saving) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing || !event.ctrlKey || event.shiftKey
+        || event.altKey || event.metaKey || event.key.toLowerCase() !== "z") return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || target.closest("input, textarea, select, [role='textbox']"))) return;
+      if (document.querySelector("dialog[open], [role='dialog'][aria-modal='true']")) return;
+      event.preventDefault();
+      void changeVisibility(undoTargetId, false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [undoTargetId, saving, changeVisibility]);
+
   return <section className="ci-projects" aria-label="Codex 项目">
     <header className="ci-projects-heading">
       <h2>Codex 项目 <span>{active.length}</span></h2>
       <button type="button" className="ci-project-filter" aria-pressed={trackedOnly}
         onClick={() => onTrackedOnly(!trackedOnly)}><Star size={14} />仅追踪</button>
     </header>
-    {undoTarget && <div className="ci-project-undo">
+    {showUndo && undoTarget && <div className="ci-project-undo">
       <span role="status">已移出「{undoTarget.settings.displayName ?? undoTarget.name}」</span>
-      <button type="button" ref={undoButton} disabled={saving}
+      <button type="button" ref={undoButton} disabled={saving} aria-keyshortcuts="Control+Z" title="撤销移出（Ctrl+Z）"
         onClick={() => void changeVisibility(undoTarget.id, false)}>撤销</button>
     </div>}
     <button type="button" className="ci-project-all" ref={allProjectsButton} aria-pressed={selected === "all"}

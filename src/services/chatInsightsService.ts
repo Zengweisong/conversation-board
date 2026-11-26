@@ -2,6 +2,19 @@ import type { Note } from "../types/note";
 import type { Category } from "../types/category";
 import { localDateKey, noteDateKey } from "./noteDateService";
 
+export const codeChangeEvidencePrefix = "Codex 已修改：";
+
+interface CodexTurnUsage {
+  totalTokens: number | null;
+  quotaChanges: { windowMinutes: number; percentagePoints: number }[];
+}
+
+export interface CodexSessionUsage {
+  sessionId: string;
+  projectId: string | null;
+  days: { date: string | null; totalTokens: number | null; turns: number }[];
+}
+
 export interface ChatTaskSource {
   noteId: number;
   sessionId: string;
@@ -12,6 +25,7 @@ export interface ChatTaskSource {
   projectId?: string | null;
   dispatchThreadId?: string | null;
   dispatchState?: "running" | "completed" | "failed" | null;
+  codexUsage?: CodexTurnUsage;
 }
 export interface ChatTask { note: Note; sources: ChatTaskSource[]; }
 export interface ProjectSettings { displayName: string | null; tracked: boolean; }
@@ -82,18 +96,35 @@ export function conversationStats(tasks: readonly ChatTask[], now = new Date()) 
 
 export interface SyncDateRange { start: string; end: string; }
 
+const recentPeriods = { today: 1, week: 7, month: 30 } as const;
+export type DatePeriod = "all" | "custom" | keyof typeof recentPeriods;
+export const datePeriodOptions: readonly { value: DatePeriod; label: string }[] = [
+  { value: "all", label: "全部日期" },
+  { value: "today", label: "今天" },
+  { value: "week", label: "近 7 天" },
+  { value: "month", label: "近 30 天" },
+  { value: "custom", label: "自定义日期" }
+];
+export const emptyDateRange: SyncDateRange = { start: "", end: "" };
+
 export function recentSyncDateRange(days: number, now = new Date()): SyncDateRange {
   const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - days + 1);
   return { start: localDateKey(start), end: localDateKey(now) };
 }
 
-export function syncedInDateRange(task: ChatTask, { start, end }: SyncDateRange) {
-  if (!start && !end) return true;
+export function dateRangeForPeriod(period: DatePeriod, customDates: SyncDateRange): SyncDateRange {
+  return period === "all" ? emptyDateRange : period === "custom" ? customDates : recentSyncDateRange(recentPeriods[period]);
+}
+
+export function dateInRange(day: string | null, { start, end }: SyncDateRange) {
+  return (!start && !end) || (day !== null && (!start || day >= start) && (!end || day <= end));
+}
+
+export function syncedInDateRange(task: ChatTask, range: SyncDateRange) {
+  if (!range.start && !range.end) return true;
   return task.sources.some(({ syncedAt }) => {
     if (!syncedAt) return false;
     const date = new Date(syncedAt);
-    if (Number.isNaN(date.getTime())) return false;
-    const day = localDateKey(date);
-    return (!start || day >= start) && (!end || day <= end);
+    return !Number.isNaN(date.getTime()) && dateInRange(localDateKey(date), range);
   });
 }

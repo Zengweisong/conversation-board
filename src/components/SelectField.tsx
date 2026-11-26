@@ -16,11 +16,12 @@ interface Props<T extends SelectValue> {
   onChange: (value: T) => void;
   leadingIcon?: ReactNode;
   variant?: "toolbar" | "form";
+  inline?: boolean;
   disabled?: boolean;
   title?: string;
 }
 
-export function SelectField<const T extends SelectValue>({ id, label, value, placeholder = "请选择", options, onChange, leadingIcon, variant, disabled, title }: Props<T>) {
+export function SelectField<const T extends SelectValue>({ id, label, value, placeholder = "请选择", options, onChange, leadingIcon, variant, inline = false, disabled, title }: Props<T>) {
   const listId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const search = useRef({ text: "", at: 0 });
@@ -33,7 +34,7 @@ export function SelectField<const T extends SelectValue>({ id, label, value, pla
     setIndex(null);
     search.current.text = "";
   }, []);
-  const { field, popup, portalRoot } = useAnchoredPopover(open, dismiss, { matchAnchor: true, preferBelow: variant !== undefined });
+  const { field, popup, portalRoot } = useAnchoredPopover(open, dismiss, { matchAnchor: true, preferBelow: variant !== undefined, inline });
 
   useLayoutEffect(() => {
     if (disabled) dismiss();
@@ -100,6 +101,21 @@ export function SelectField<const T extends SelectValue>({ id, label, value, pla
     }
   };
 
+  const listbox = open && <div ref={popup} id={listId} className="select-field-popover" role="listbox"
+    aria-label={label} data-variant={variant} data-inline={inline ? "" : undefined}
+    onPointerDown={(event) => event.stopPropagation()}>
+    {options.map((option, position) => <div key={option.value} id={`${listId}-${position}`} role="option"
+      aria-selected={position === selected} className={active === position ? "active" : undefined}
+      onPointerMove={() => setIndex(position)} onMouseDown={(event) => event.preventDefault()}
+      onClick={() => choose(option)}>
+      <span className="select-field-value">
+        {option.swatch && <span className="select-field-swatch" style={{ backgroundColor: option.swatch }} aria-hidden="true" />}
+        <span>{option.label}</span>
+      </span>
+      {position === selected && <Check size={14} aria-hidden="true" />}
+    </div>)}
+  </div>;
+
   return <div ref={field} className="select-field" data-variant={variant}>
     <button id={id} ref={trigger} type="button" role="combobox" className="select-field-trigger" aria-label={label}
       title={title ?? (variant === "toolbar" ? options[selected]?.label : undefined)}
@@ -118,21 +134,6 @@ export function SelectField<const T extends SelectValue>({ id, label, value, pla
       </span>
       <ChevronDown size={14} aria-hidden="true" />
     </button>
-    {open && createPortal(
-      <div ref={popup} id={listId} className="select-field-popover" role="listbox" aria-label={label} data-variant={variant}
-        onPointerDown={(event) => event.stopPropagation()}>
-        {options.map((option, position) => <div key={option.value} id={`${listId}-${position}`} role="option"
-          aria-selected={position === selected} className={active === position ? "active" : undefined}
-          onPointerMove={() => setIndex(position)} onMouseDown={(event) => event.preventDefault()}
-          onClick={() => choose(option)}>
-          <span className="select-field-value">
-            {option.swatch && <span className="select-field-swatch" style={{ backgroundColor: option.swatch }} aria-hidden="true" />}
-            <span>{option.label}</span>
-          </span>
-          {position === selected && <Check size={14} aria-hidden="true" />}
-        </div>)}
-      </div>,
-      portalRoot
-    )}
+    {inline ? listbox : open && createPortal(listbox, portalRoot)}
   </div>;
 }

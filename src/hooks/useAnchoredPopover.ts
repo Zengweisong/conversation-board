@@ -1,11 +1,11 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 
-export function useAnchoredPopover(open: boolean, dismiss: () => void, { compact = false, matchAnchor = false, preferBelow = false } = {}) {
+export function useAnchoredPopover(open: boolean, dismiss: () => void, { compact = false, matchAnchor = false, preferBelow = false, inline = false } = {}) {
   const field = useRef<HTMLDivElement>(null);
   const popup = useRef<HTMLDivElement>(null);
 
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!open || inline) return;
     const place = () => {
       const anchor = field.current?.getBoundingClientRect();
       const panel = popup.current;
@@ -38,7 +38,7 @@ export function useAnchoredPopover(open: boolean, dismiss: () => void, { compact
       window.removeEventListener("resize", place);
       window.removeEventListener("scroll", followScroll, true);
     };
-  }, [open, compact, matchAnchor, preferBelow]);
+  }, [open, compact, matchAnchor, preferBelow, inline]);
 
   useEffect(() => {
     if (!open) return;

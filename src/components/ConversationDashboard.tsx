@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { Archive, ArchiveRestore, ArrowLeft, CalendarDays, Columns3, FolderClosed, MessageSquare, Pencil, Plus, RefreshCw, Search } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, CalendarDays, Columns3, FolderClosed, Gauge, MessageSquare, Pencil, Plus, RefreshCw, Search } from "lucide-react";
 import type { Note, NoteContentUpdate } from "../types/note";
 import type { Category } from "../types/category";
 import type { BoardStatus } from "../types/board";
-import { conversationProjectIds, conversationStats, conversationTasks, recentSyncDateRange, syncedInDateRange,
-  type ChatTaskSource, type CodexProject, type ProjectCatalog, type ProjectSettings, type SyncDateRange } from "../services/chatInsightsService";
+import { codeChangeEvidencePrefix, conversationProjectIds, conversationStats, conversationTasks, datePeriodOptions, dateRangeForPeriod,
+  emptyDateRange, syncedInDateRange, type ChatTaskSource, type CodexProject, type DatePeriod, type ProjectCatalog, type ProjectSettings } from "../services/chatInsightsService";
 import { schedulePartsFromIso } from "../services/noteDateService";
 import { ConversationProjects } from "./ConversationProjects";
+import { ProjectUsageDashboard } from "./ProjectUsageDashboard";
 import { CodexThreadPicker, ConversationTaskDispatch, conversationDispatchMessage, sendConversationTask } from "./ConversationTaskDispatch";
 import { NoteCard } from "./NoteCard";
-import { SelectField, type SelectOption } from "./SelectField";
+import { SelectField } from "./SelectField";
 import "./ConversationDashboard.css";
 
 interface Props {
@@ -30,16 +31,10 @@ const columns = [
   { id: "doing", label: "进行中" },
   { id: "completed", label: "已完成" }
 ] as const;
-const recentPeriods = { today: 1, week: 7, month: 30 } as const;
-type Period = "all" | "custom" | keyof typeof recentPeriods;
-const periodOptions: readonly SelectOption<Period>[] = [
-  { value: "all", label: "全部日期" },
-  { value: "today", label: "今天" },
-  { value: "week", label: "近 7 天" },
-  { value: "month", label: "近 30 天" },
-  { value: "custom", label: "自定义日期" }
-];
-const emptyDateRange: SyncDateRange = { start: "", end: "" };
+const usageNumber = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
+const compactUsageNumber = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 });
+const quotaWindowLabel = (minutes: number) => minutes % 1440 === 0 ? `${minutes / 1440} 天`
+  : minutes % 60 === 0 ? `${minutes / 60} 小时` : `${minutes} 分钟`;
 const taskStatus = (note: Note): BoardStatus => note.completed ? "completed" : note.status;
 const dateLabel = (value: string | null) => {
   if (!value || Number.isNaN(new Date(value).getTime())) return "时间未知";
@@ -60,6 +55,8 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
   const [project, setProject] = useState("all");
   const [trackedOnly, setTrackedOnly] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
+  const [showUsage, setShowUsage] = useState(false);
+  const usageButton = useRef<HTMLButtonElement>(null);
   const [draft, setDraft] = useState<{ content: string; projectId: string } | null>(null);
   const [choosingDraftThread, setChoosingDraftThread] = useState(false);
   const [adding, setAdding] = useState<"save" | "send" | null>(null);
@@ -67,7 +64,7 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
   const outsideSaveInFlight = useRef<Promise<boolean> | null>(null);
   const [addError, setAddError] = useState("");
   const [addFeedback, setAddFeedback] = useState<{ message: string; error: boolean } | null>(null);
-  const [period, setPeriod] = useState<Period>("all");
+  const [period, setPeriod] = useState<DatePeriod>("all");
   const [customDates, setCustomDates] = useState(emptyDateRange);
   const [editingId, setEditingId] = useState<number | null>(null);
   const dashboardRef = useRef<HTMLElement>(null);
@@ -160,7 +157,7 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
     return projectDescriptions.has(id) ? `${label} · #${id.slice(-6)}` : label;
   };
   const activeProjectPath = projectDescriptions.get(activeProject) ?? registeredById.get(activeProject)?.rootPaths.join("\n");
-  const dateRange = period === "all" ? emptyDateRange : period === "custom" ? customDates : recentSyncDateRange(recentPeriods[period]);
+  const dateRange = dateRangeForPeriod(period, customDates);
   const invalidDates = Boolean(dateRange.start && dateRange.end && dateRange.start > dateRange.end);
   const periodTasks = tasks.filter((task) => syncedInDateRange(task, dateRange));
   const archivedCount = tasks.filter(({ sources }) => sources[0].archived).length;
@@ -190,17 +187,16 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
     setDraft(null);
   }, []);
   const addTask = useCallback(async ({ threadId, outsideClick = false }: { threadId?: string | null; outsideClick?: boolean } = {}) => {
-    if (addInFlight.current || !draft?.content.trim()) return false;
-    const [firstLine, ...body] = draft.content.trim().split(/\r\n?|\n/);
-    const title = firstLine.trim();
-    const details = body.join("\n").trim();
+    if (addInFlight.current || !draft) return false;
+    const prompt = draft.content.trim();
+    if (!prompt) return false;
     const projectId = draft.projectId || null;
     addInFlight.current = true;
     setAdding(threadId === undefined ? "save" : "send");
     setAddError("");
     setAddFeedback(null);
     try {
-      const task = await invoke<ChatTaskSource>("create_chat_board_task", { title, details, projectId });
+      const task = await invoke<ChatTaskSource>("create_chat_board_task", { title: prompt, details: "", projectId });
       sourceRevision.current++;
       setSources((current) => [...(current ?? []).filter((source) => source.noteId !== task.noteId), task]);
       let feedback: typeof addFeedback = null;
@@ -293,7 +289,16 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
     await invoke("set_chat_sync_project_hidden", { projectId, hidden });
     updateProject(projectId, { hidden });
     if (hidden) setProject((current) => current === projectId ? "all" : current);
+    setRefresh((value) => value + 1);
   };
+
+  if (showUsage && catalog) return <section className="ci-dashboard ci-analysis-view">
+    <ProjectUsageDashboard
+      projects={registered.filter(({ hidden, settings }) => !hidden && (!trackedOnly || settings.tracked))}
+      tasks={tasks} projectIds={projectIds} initialProject={activeProject}
+      onBack={() => { setShowUsage(false); requestAnimationFrame(() => usageButton.current?.focus()); }}
+      onSelect={(id) => { setProject(id); setShowUsage(false); }} />
+  </section>;
 
   return <section ref={dashboardRef} className="ci-dashboard" aria-label="对话分析看板">
     <div className={`ci-workspace ${!sidebarCollapsed && (catalog || projectError) ? "has-projects" : ""}`}>
@@ -307,6 +312,8 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
               selected={activeProject} trackedOnly={trackedOnly}
               onSelect={setProject} onTrackedOnly={(enabled) => { setTrackedOnly(enabled); setProject("all"); }}
               onSave={saveProject} onSetHidden={setProjectHidden} />}
+            {catalog && <button ref={usageButton} className="ci-usage-entry" type="button"
+              onClick={() => setShowUsage(true)}><Gauge size={16} aria-hidden="true" /><span>仪表盘</span><span aria-hidden="true">↗</span></button>}
           </div>
         </div>
       </aside>
@@ -348,7 +355,7 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
           <div className="ci-board-controls">
             <div className="ci-toolbar">
               <div className="ci-period-picker">
-                <SelectField label="同步日期范围" variant="toolbar" value={period} options={periodOptions}
+                <SelectField label="同步日期范围" variant="toolbar" value={period} options={datePeriodOptions}
                   leadingIcon={<CalendarDays size={14} />} onChange={setPeriod} />
               </div>
               <div className={`ci-project-picker${railCoversProjectFilter ? " ci-project-picker-redundant" : ""}`}>
@@ -388,11 +395,13 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
                   {items.map(({ note, sources: evidence }) => {
                     const completedAt = note.completed ? note.completedAt : null;
                     const { date, time } = schedulePartsFromIso(completedAt);
-                    const summary = evidence.find((source) => source.evidence)?.evidence || note.details;
+                    const latestEvidence = evidence.find((source) => source.evidence);
+                    const summary = latestEvidence?.evidence.startsWith(codeChangeEvidencePrefix) ? null : latestEvidence?.evidence || note.details;
                     const projectId = projectIds.get(note.id)!;
                     const taskProject = evidence.find((source) => source.manual && source.projectId)?.projectId
                       ?? (registeredById.has(projectId) ? projectId : null);
                     const dispatch = evidence.find(({ dispatchThreadId }) => dispatchThreadId);
+                    const usage = evidence.find(({ manual, codexUsage }) => manual && codexUsage)?.codexUsage ?? latestEvidence?.codexUsage;
                     const preferredThreadId = dispatch?.dispatchThreadId ?? evidence.find((source) => source.manual && source.sessionId)?.sessionId ?? evidence.find(({ sessionId }) => sessionId)?.sessionId ?? "";
                     return <article className="ci-task" key={note.id}
                       onClick={(event) => {
@@ -408,14 +417,34 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
                         onClick={(event) => openEditor(note.id, event.currentTarget)}>
                         <strong>{note.title}</strong>{summary && <span className="ci-task-evidence">{summary}</span>}
                       </button>
-                      {(canAdd || Boolean(preferredThreadId)) && <ConversationTaskDispatch noteId={note.id} title={note.title} disabled={archiving} canSend={canAdd}
+                      {usage && <div className="ci-task-usage">
+                        {usage.totalTokens != null && <div className="ci-task-token-usage"
+                          title={`本轮 Codex 用量 ${usageNumber.format(usage.totalTokens)} Token`}>
+                          <span>Codex 用量</span>
+                          <strong>{compactUsageNumber.format(usage.totalTokens)} Token</strong>
+                        </div>}
+                        {usage.quotaChanges.length > 0 && <div className="ci-task-quota">
+                          {usage.quotaChanges.map(({ windowMinutes, percentagePoints }, index) => {
+                            const windowLabel = quotaWindowLabel(windowMinutes);
+                            const points = usageNumber.format(percentagePoints);
+                            return <div className="ci-task-quota-meter" key={`${windowMinutes}-${index}`} role="meter"
+                              aria-label={`${windowLabel}剩余额度降幅`} aria-valuemin={0} aria-valuemax={100}
+                              aria-valuenow={percentagePoints} aria-valuetext={`减少 ${points} 个百分点`}
+                              title={`${windowLabel}剩余额度减少 ${points} 个百分点。来自账户快照，可能包含同期其他对话。`}>
+                              <span className="ci-task-quota-label" aria-hidden="true"><span>{windowLabel}额度</span><strong>−{points} 点</strong></span>
+                              <span className="ci-task-quota-track" aria-hidden="true">
+                                <span style={{ width: `${percentagePoints}%` }} />
+                              </span>
+                            </div>;
+                          })}
+                        </div>}
+                      </div>}
+                      <ConversationTaskDispatch noteId={note.id} title={note.title} disabled={archiving} canSend={canAdd}
                         projectId={taskProject} projectLabel={taskProject && registeredById.has(taskProject) ? projectOption(taskProject) : undefined}
-                        preferredThreadId={preferredThreadId} onSent={onNotesChanged}
-                        dispatchState={dispatch?.dispatchState} />}
-                      <div className="ci-task-footer">
-                        {completedAt && date && time && <time className="ci-task-completed-at" dateTime={completedAt}
-                          title={`完成于 ${date} ${time}`}>完成于 {date} {time}</time>}
-                        <div className="ci-task-actions">
+                        preferredThreadId={preferredThreadId} onSent={onNotesChanged} dispatchState={dispatch?.dispatchState}
+                        completion={completedAt && date && time && <time className="ci-task-completed-at" dateTime={completedAt}
+                          title={`完成于 ${date} ${time}`} aria-label={`完成于 ${date} ${time}`}>{date.slice(5)} {time}</time>}
+                        cardActions={<>
                           <button type="button" title={showArchived ? "恢复事项" : "归档事项"} disabled={archiving}
                             aria-label={`${showArchived ? "恢复事项" : "归档事项"} ${note.title}`}
                             onClick={(event) => void setArchived(note.id, !showArchived, event.currentTarget)}>
@@ -423,8 +452,7 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
                           </button>
                           <button type="button" className="ci-task-edit" title="编辑事项" aria-label={`编辑事项 ${note.title}`} aria-haspopup="dialog"
                             onClick={(event) => openEditor(note.id, event.currentTarget)}><Pencil size={14} aria-hidden="true" /></button>
-                        </div>
-                      </div>
+                        </>} />
                     </article>;
                   })}
                   {canAdd && draft && <form ref={addForm} className="ci-create-task" data-popover-root aria-label="添加待处理事项" onSubmit={(event) => { event.preventDefault(); void addTask(); }}
@@ -433,8 +461,17 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
                       event.preventDefault();
                       closeDraft();
                     }}>
-                    <textarea autoFocus required aria-label="待处理事项内容" placeholder="首行写标题，换行补充说明"
-                      rows={4} value={draft.content} disabled={adding !== null} onChange={(event) => setDraft({ ...draft, content: event.target.value })} />
+                    <input type="text" autoFocus required aria-label="Codex 提示词"
+                      value={draft.content} disabled={adding !== null} onChange={(event) => setDraft({ ...draft, content: event.target.value })}
+                      onPaste={(event) => {
+                        const pasted = event.clipboardData.getData("text/plain");
+                        if (!/[\r\n]/.test(pasted)) return;
+                        event.preventDefault();
+                        const field = event.currentTarget;
+                        field.setRangeText(pasted.replace(/[\t ]*[\r\n][\t \r\n]*/g, " "),
+                          field.selectionStart ?? field.value.length, field.selectionEnd ?? field.value.length, "end");
+                        setDraft({ ...draft, content: field.value });
+                      }} />
                     {visibleProjectIds.length > 0 && <SelectField label="待处理事项项目" variant="form"
                       value={draft.projectId} disabled={adding !== null}
                       options={[{ value: "", label: "不指定项目" },

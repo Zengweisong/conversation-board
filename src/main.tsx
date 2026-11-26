@@ -2,25 +2,20 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, PanelLeftClose, PanelLeftOpen, Settings, Square, X } from "lucide-react";
+import { Minus, Moon, PanelLeftClose, PanelLeftOpen, Settings, Square, X } from "lucide-react";
 import { ChatSyncSettings } from "./components/ChatSyncSettings";
 import { SyncAnalysisSettings } from "./components/SyncAnalysisSettings";
 import { ConversationDashboard } from "./components/ConversationDashboard";
 import { SelectField, type SelectOption } from "./components/SelectField";
+import { ThemeColorPicker } from "./components/ThemeColorPicker";
 import { useCategories } from "./hooks/useCategories";
 import { useNotes } from "./hooks/useNotes";
 import { startBackgroundTaskService } from "./services/backgroundTaskService";
-import { loadSettings, saveCloseAction, saveTheme } from "./services/settingsService";
-import type { AppSettings, CloseAction, ThemeName } from "./types/settings";
+import { loadSettings, saveAppearance, saveCloseAction } from "./services/settingsService";
+import { themeColorStyle } from "./services/themeColor";
+import type { AppearanceSettings, AppSettings, CloseAction } from "./types/settings";
 import "./styles.css";
 import "./window.css";
-
-const themeOptions: readonly SelectOption<ThemeName>[] = [
-  { value: "warm", label: "暖色", swatch: "#eeebe4" },
-  { value: "light", label: "浅色", swatch: "#e8eef6" },
-  { value: "dark", label: "深色", swatch: "#292e37" },
-  { value: "green", label: "墨绿色", swatch: "#3b5143" }
-];
 
 const closeActionOptions: readonly SelectOption<CloseAction>[] = [
   { value: "ask", label: "每次询问" },
@@ -33,6 +28,7 @@ function ConversationBoardApp() {
   const [appearance, setAppearance] = useState<AppSettings | null>(null);
   const [themeBusy, setThemeBusy] = useState(false);
   const [themeError, setThemeError] = useState("");
+  const [themeColorDraft, setThemeColorDraft] = useState<string | null>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
   const [closeError, setCloseError] = useState("");
@@ -147,25 +143,38 @@ function ConversationBoardApp() {
   const appWindow = getCurrentWindow();
   const openSettings = () => {
     setThemeError("");
+    setThemeColorDraft(undefined);
     setCloseSettingsError("");
     settings.current?.showModal();
   };
   const sidebarAction = sidebarCollapsed ? "展开侧边栏" : "收起侧边栏";
+  const { darkMode, themeColor: savedColor, savedThemeColors } = appearance;
+  const themeColor = themeColorDraft === undefined ? savedColor : themeColorDraft;
   function runWindowAction(action: Promise<void>) {
     void action.catch((error) => setError(String(error)));
   }
 
-  async function changeTheme(theme: ThemeName) {
+  async function updateAppearance(next: AppearanceSettings) {
     setThemeBusy(true);
     setThemeError("");
     try {
-      await saveTheme(theme);
+      await saveAppearance(next);
       settingsRevision.current++;
-      setAppearance((current) => current && { ...current, theme });
+      setAppearance((current) => current && { ...current, ...next });
+      return true;
     } catch (error) {
       setThemeError(error instanceof Error ? error.message : String(error));
+      return false;
     } finally {
       setThemeBusy(false);
+    }
+  }
+
+  async function applyThemeColor(color: string | null) {
+    const colors = color && !savedThemeColors.includes(color) ? [color, ...savedThemeColors] : savedThemeColors;
+    if ((color === savedColor && colors === savedThemeColors)
+      || await updateAppearance({ darkMode, themeColor: color, savedThemeColors: colors })) {
+      setThemeColorDraft(undefined);
     }
   }
 
@@ -184,8 +193,8 @@ function ConversationBoardApp() {
     }
   }
 
-  return <main className={`app-shell view-insights theme-${appearance.theme} font-size-${appearance.fontSize} ${appearance.minimalMode ? "minimal-mode" : ""}`}
-    style={{ display: "flex", flexDirection: "column", padding: 0, background: "rgb(var(--panel-rgb))" }}>
+  return <main className={`app-shell view-insights ${darkMode ? "theme-dark" : "theme-light"} font-size-${appearance.fontSize} ${appearance.minimalMode ? "minimal-mode" : ""}`}
+    style={{ display: "flex", flexDirection: "column", padding: 0, ...themeColorStyle(themeColor, darkMode) }}>
     <header className="ci-window-bar" data-tauri-drag-region>
       <button type="button" className="ci-sidebar-toggle" aria-label={sidebarAction} title={sidebarAction}
         aria-expanded={!sidebarCollapsed} aria-controls="ci-project-sidebar"
@@ -209,24 +218,36 @@ function ConversationBoardApp() {
         </div>}
         onEdit={notes.editContent} saveDraftBeforeClose={saveDraftBeforeClose} />
     </div>
-    <dialog id="ci-settings-dialog" ref={settings} aria-label="设置"
-      style={{ width: "min(420px, calc(100% - 32px))", border: "1px solid var(--border)", borderRadius: 12,
-        padding: 20, background: "rgb(var(--card-rgb))", color: "var(--text)" }}>
+    <dialog id="ci-settings-dialog" ref={settings} aria-label="设置" onClose={() => setThemeColorDraft(undefined)}>
       <div className="ci-setting-field">
-        <label htmlFor="ci-theme">主题</label>
-        <SelectField id="ci-theme" label="主题" variant="form" value={appearance.theme}
-          options={themeOptions} disabled={themeBusy} onChange={(theme) => void changeTheme(theme)} />
+        <div className="ci-settings-heading">
+          <span>外观</span>
+          <form method="dialog">
+            <button type="submit" className="ci-settings-close" aria-label="关闭设置" title="关闭设置">
+              <X size={16} aria-hidden="true" />
+            </button>
+          </form>
+        </div>
+        <div className="ci-theme-mode">
+          <Moon size={15} aria-hidden="true" />
+          <span id="ci-dark-mode-label">深色模式</span>
+          <button type="button" role="switch" className="chat-sync-switch" aria-labelledby="ci-dark-mode-label"
+            aria-checked={darkMode} disabled={themeBusy}
+            onClick={() => void updateAppearance({ darkMode: !darkMode, themeColor: savedColor, savedThemeColors })}><span /></button>
+        </div>
+        <ThemeColorPicker color={themeColor} savedColor={savedColor}
+          savedThemeColors={savedThemeColors} busy={themeBusy} onPreview={setThemeColorDraft}
+          onSave={() => void applyThemeColor(themeColor)} onUseSaved={(color) => void applyThemeColor(color)} />
         {themeError && <p className="chat-sync-error" role="alert">{themeError}</p>}
       </div>
-      <ChatSyncSettings onChanged={refresh} />
+      <ChatSyncSettings />
       <SyncAnalysisSettings />
       <div className="ci-setting-field">
         <label htmlFor="ci-close-action">关闭窗口时</label>
-        <SelectField id="ci-close-action" label="关闭窗口时" variant="form" value={appearance.closeAction}
+        <SelectField id="ci-close-action" label="关闭窗口时" variant="form" inline value={appearance.closeAction}
           options={closeActionOptions} disabled={closeBusy} onChange={(action) => void changeCloseAction(action)} />
         {closeSettingsError && <p className="chat-sync-error" role="alert">{closeSettingsError}</p>}
       </div>
-      <form method="dialog"><button type="submit">关闭</button></form>
     </dialog>
     <dialog ref={closeDialog} className="confirm-dialog window-close-dialog ci-close-dialog"
       data-window-close-control aria-labelledby="ci-close-title" aria-describedby="ci-close-message"

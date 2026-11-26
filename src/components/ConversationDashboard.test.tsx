@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { insightNote, insightSources } from "../../tests/chatInsightsFixtures";
 import { ConversationDashboard } from "./ConversationDashboard";
 import { localDateKey } from "../services/noteDateService";
+import type { CodexSessionUsage } from "../services/chatInsightsService";
 import type { Note } from "../types/note";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -14,11 +15,143 @@ let root: Root;
 let container: HTMLDivElement;
 afterEach(async () => { await act(async () => root?.unmount()); container?.remove(); vi.resetAllMocks(); vi.useRealTimers(); });
 const filterTrigger = (label: string) => container.querySelector<HTMLButtonElement>(`[role="combobox"][aria-label="${label}"]`)!;
+it("counts conversations without board items and opens the project from the usage ranking", async () => {
+  const repeatedSource = { ...insightSources[0], noteId: 5, syncedAt: new Date().toISOString() };
+  mockRecords(false, [...insightSources, repeatedSource].map((source) => source.sessionId === "session-a" ? {
+    ...source, codexUsage: { totalTokens: 1200, quotaChanges: [] },
+    evidence: source.noteId === 1 ? "Codex 已修改：./src/App.tsx、src/App.tsx、src/styles.css"
+      : source.noteId === 5 ? "Codex 已修改：src\\App.tsx" : source.evidence
+  } : source), [
+    { sessionId: "session-a", projectId: null, days: [{ date: null, totalTokens: 1200, turns: 1 }] },
+    { sessionId: "question-only", projectId: "app", days: [{ date: null, totalTokens: 800, turns: 2 }] },
+    { sessionId: "no-token-data", projectId: "empty", days: [{ date: null, totalTokens: null, turns: 1 }] }
+  ]);
+  await render(() => [insightNote(5, { title: "登录功能！" })]);
+
+  expect(container.querySelector(".ci-analysis")).toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>(".ci-usage-entry")!.click());
+  const usage = container.querySelector(".ci-usage")!;
+  expect(usage.querySelector(".ci-usage-total")?.getAttribute("title")).toBe("2,000 Token");
+  expect(usage.querySelector(".ci-usage-caption")?.textContent).toContain("3 个对话");
+  expect(usage.querySelector('[aria-label="还没有事项的项目，Token 暂无记录 · 1 轮 · 1 个对话"]')).not.toBeNull();
+  const pie = usage.querySelector<HTMLElement>(".ci-usage-pie")!;
+  vi.spyOn(pie, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 200, 200));
+  await act(async () => pie.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 180, clientY: 100 })));
+  expect(pie.querySelector(".ci-usage-total")?.textContent).toBe("开发工具2,000Token");
+  await act(async () => pie.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 100, clientY: 100 })));
+  expect(pie.querySelector(".ci-usage-total")?.textContent).toContain("总 Token");
+  expect(usage.querySelector(".ci-usage-ranking")?.textContent).toContain("100.0%");
+  expect(container.querySelector(".ci-analysis-timeline")?.textContent).toContain("登录功能！");
+  expect(container.querySelector(".ci-analysis-radar li")?.textContent).toBe("src/App.tsx2 次");
+  const datePicker = container.querySelector<HTMLButtonElement>('button[aria-label="工作日期"]')!;
+  await act(async () => datePicker.click());
+  const calendar = document.getElementById(datePicker.getAttribute("aria-controls")!)!;
+  expect(calendar.getAttribute("role")).toBe("dialog");
+  await act(async () => calendar.querySelector<HTMLButtonElement>(".date-popover-today")!.click());
+  const radarProject = filterTrigger("雷达项目");
+  await act(async () => radarProject.click());
+  await act(async () => filterOptions(radarProject).find((option) => option.textContent?.includes("还没有事项的项目"))!.click());
+  expect(container.querySelector(".ci-analysis-radar")).toBeNull();
+  expect(container.textContent).toContain("该项目暂无文件改动记录");
+  const project = usage.querySelector<HTMLButtonElement>('button[aria-label="开发工具，2,000 Token · 3 轮 · 2 个对话"]')!;
+  await act(async () => project.click());
+  expect(container.querySelector(".ci-analysis")).toBeNull();
+  expect(container.querySelector('.ci-project-select[aria-pressed="true"]')?.textContent).toContain("开发工具");
+});
 const filterOptions = (trigger: HTMLButtonElement) =>
   [...document.getElementById(trigger.getAttribute("aria-controls")!)!.querySelectorAll<HTMLElement>('[role="option"]')];
+it("analyzes the selected radar project on demand and shows counts with original requests", async () => {
+  mockRecords();
+  const native = vi.mocked(invoke).getMockImplementation()!;
+  let finish!: (result: unknown) => void;
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "analyze_chat_project_requirements") {
+      if ((args as { projectId: string }).projectId === "empty") throw new Error("请先填写 API 配置");
+      return new Promise((resolve) => { finish = resolve; });
+    }
+    return native(command, args);
+  });
+  await render();
+  await act(async () => container.querySelector<HTMLButtonElement>(".ci-usage-entry")!.click());
+  expect(invoke).not.toHaveBeenCalledWith("analyze_chat_project_requirements", expect.anything());
+  const radar = container.querySelector(".ci-repeat-card")!;
+  const action = () => radar.querySelector<HTMLButtonElement>(".ci-repeated-actions button")!;
+  await act(async () => action().click());
+  expect(action().disabled).toBe(true);
+  expect(invoke).toHaveBeenLastCalledWith("analyze_chat_project_requirements", { projectId: "app" });
+  await act(async () => finish({
+    reviewedRequests: 5,
+    groups: [{ title: "增加日期筛选", count: 2, examples: ["补一个起止日期选择"] }]
+  }));
+  expect(action().disabled).toBe(false);
+  const results = container.querySelector(".ci-analysis-result")!;
+  expect(results).toBe(radar.nextElementSibling);
+  expect(radar.querySelector(".ci-repeated-results")).toBeNull();
+  expect(results.querySelector(".ci-repeated-results summary")?.textContent).toBe("增加日期筛选2 次");
+  expect(results.querySelector("blockquote")?.textContent).toBe("补一个起止日期选择");
+  const project = filterTrigger("雷达项目");
+  await act(async () => project.click());
+  await act(async () => filterOptions(project).find((option) => option.textContent === "还没有事项的项目")!.click());
+  expect(container.querySelector(".ci-analysis-result")).toBeNull();
+  await act(async () => action().click());
+  expect(invoke).toHaveBeenLastCalledWith("analyze_chat_project_requirements", { projectId: "empty" });
+  expect(container.querySelector('.ci-analysis-result [role="alert"]')?.textContent).toContain("请先填写 API 配置");
+});
+it("filters usage by local turn dates and counts a conversation only once across matching days", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(2026, 10, 26, 12));
+  mockRecords(false, insightSources, [
+    { sessionId: "multi-day", projectId: "app", days: [
+      { date: "2026-11-20", totalTokens: 200, turns: 1 },
+      { date: "2026-11-26", totalTokens: 100, turns: 2 }
+    ] },
+    { sessionId: "another", projectId: "empty", days: [{ date: "2026-11-20", totalTokens: 300, turns: 1 }] },
+    { sessionId: "earlier", projectId: "app", days: [{ date: "2026-11-11", totalTokens: 400, turns: 1 }] },
+    { sessionId: "undated", projectId: "app", days: [{ date: null, totalTokens: 200, turns: 1 }] }
+  ]);
+  await render();
+  await act(async () => container.querySelector<HTMLButtonElement>(".ci-usage-entry")!.click());
+  const usage = container.querySelector(".ci-analysis-share")!;
+  const range = filterTrigger("用量日期范围");
+  const pickRange = async (label: string) => {
+    await act(async () => range.click());
+    await act(async () => filterOptions(range).find((option) => option.textContent === label)!.click());
+  };
+  const expectUsage = (tokens: string, sessions: number) => {
+    expect(usage.querySelector(".ci-usage-total")?.getAttribute("title")).toBe(`${tokens} Token`);
+    expect(usage.querySelector(".ci-usage-caption")?.textContent).toContain(`${sessions} 个对话`);
+  };
+  expectUsage("1,200", 4);
+  await pickRange("今天");
+  expectUsage("100", 1);
+  expect(usage.querySelector('[aria-label="开发工具，100 Token · 2 轮 · 1 个对话"]')).not.toBeNull();
+  await pickRange("近 7 天");
+  expectUsage("600", 2);
+  expect(usage.querySelector(".ci-usage-ranking strong")?.textContent).toBe("50.0%");
+  await pickRange("近 30 天");
+  expectUsage("1,000", 3);
+  await pickRange("自定义日期");
+  const pickDate = async (field: string, date: number) => {
+    const trigger = usage.querySelector<HTMLButtonElement>(`[aria-label="${field}"]`)!;
+    await act(async () => trigger.click());
+    const calendar = document.getElementById(trigger.getAttribute("aria-controls")!)!;
+    const label = new Intl.DateTimeFormat("zh-CN", { dateStyle: "full" }).format(new Date(2026, 10, date));
+    await act(async () => calendar.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`)!.click());
+  };
+  await pickDate("用量开始日期", 20);
+  await pickDate("用量结束日期", 20);
+  expectUsage("500", 2);
+  expect(usage.querySelector(".ci-usage-ranking strong")?.textContent).toBe("60.0%");
+  await pickDate("用量开始日期", 21);
+  expect(usage.querySelector('[role="alert"]')?.textContent).toContain("开始日期不能晚于结束日期");
+  expect(usage.querySelector(".ci-usage-total")).toBeNull();
+  await pickRange("全部日期");
+  expectUsage("1,200", 4);
+  expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "get_chat_sync_project_usage")).toHaveLength(1);
+});
 const enterTaskContent = (form: HTMLFormElement, content: string) => act(async () => {
-  const field = form.querySelector<HTMLTextAreaElement>("textarea")!;
-  Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(field, content);
+  const field = form.querySelector<HTMLInputElement>("input")!;
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(field, content);
   field.dispatchEvent(new Event("input", { bubbles: true }));
 });
 async function render(readManualNotes: () => Note[] = () => [], completedAt: string | null = null) {
@@ -43,7 +176,7 @@ async function render(readManualNotes: () => Note[] = () => [], completedAt: str
   await act(async () => root.render(<Dashboard />));
   return { onEdit, setSidebarCollapsed };
 }
-function mockRecords(duplicateNames = false) {
+function mockRecords(duplicateNames = false, sources = insightSources, usage: CodexSessionUsage[] = []) {
   const archived = new Set<number>();
   const projects = [
     { id: "app", name: "开发工具", rootPaths: ["C:/dev/app"], hidden: false, settings: { displayName: null as string | null, tracked: false } },
@@ -51,7 +184,8 @@ function mockRecords(duplicateNames = false) {
       rootPaths: [duplicateNames ? "C:/dev/app" : "C:/dev/empty"], hidden: false, settings: { displayName: null as string | null, tracked: false } }
   ];
   vi.mocked(invoke).mockImplementation(async (command, args) => {
-    if (command === "get_chat_sync_tasks") return insightSources.map((source) => ({ ...source, archived: archived.has(source.noteId) }));
+    if (command === "get_chat_sync_tasks") return sources.map((source) => ({ ...source, archived: archived.has(source.noteId) }));
+    if (command === "get_chat_sync_project_usage") return usage;
     if (command === "set_chat_sync_task_archived") {
       const { noteId, archived: shouldArchive } = args as { noteId: number; archived: boolean };
       if (shouldArchive) archived.add(noteId);
@@ -214,6 +348,81 @@ it("quickly removes projects and their tasks from the board, with undo and later
   expect(removeProject()).not.toBeNull();
   expect(container.querySelectorAll(".ci-task")).toHaveLength(3);
 });
+it("dismisses the latest removal notice after three seconds and keeps keyboard undo available", async () => {
+  vi.useFakeTimers();
+  mockRecords(); await render();
+  const notice = () => container.querySelector(".ci-project-undo");
+  const remove = (name: string) => act(async () => {
+    container.querySelector<HTMLButtonElement>(`[aria-label="移出看板 ${name}"]`)!.click();
+  });
+  const pressUndo = (target: HTMLElement) => {
+    const event = new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true });
+    target.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+
+  await remove("开发工具");
+  expect(notice()?.textContent).toContain("开发工具");
+  await act(async () => { vi.advanceTimersByTime(2000); });
+  await remove("还没有事项的项目");
+  await act(async () => { vi.advanceTimersByTime(2999); });
+  expect(notice()?.textContent).toContain("还没有事项的项目");
+  await act(async () => { vi.advanceTimersByTime(1); });
+  expect(notice()).toBeNull();
+
+  const search = container.querySelector<HTMLInputElement>('[aria-label="搜索对话事项"]')!;
+  search.focus();
+  expect(pressUndo(search)).toBe(false);
+  expect(invoke).not.toHaveBeenCalledWith("set_chat_sync_project_hidden", { projectId: "empty", hidden: false });
+
+  const allProjects = container.querySelector<HTMLButtonElement>(".ci-project-all")!;
+  allProjects.focus();
+  await act(async () => { expect(pressUndo(allProjects)).toBe(true); });
+  expect(invoke).toHaveBeenCalledWith("set_chat_sync_project_hidden", { projectId: "empty", hidden: false });
+  expect(container.querySelectorAll(".ci-project-select")).toHaveLength(1);
+  expect(notice()).toBeNull();
+  expect(pressUndo(allProjects)).toBe(false);
+});
+it("shows the matching turn's token use and observed quota changes on the card", async () => {
+  mockRecords();
+  const read = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation((command, args) => {
+    if (command !== "get_chat_sync_tasks") return read(command, args);
+    return Promise.resolve(insightSources.map((source) => ({
+      ...source,
+      codexUsage: source.noteId !== 1 ? undefined : {
+        totalTokens: source.sessionId === "session-b" ? 11522554 : 160,
+        quotaChanges: [{ windowMinutes: 300, percentagePoints: 20 }, { windowMinutes: 10080, percentagePoints: 3 }]
+      }
+    })));
+  });
+  await render();
+  const usage = container.querySelector('[aria-label="编辑：整理接口文档"]')?.closest(".ci-task")?.querySelector(".ci-task-usage");
+  expect(usage?.querySelector(".ci-task-token-usage strong")?.textContent).toBe("1152.3万 Token");
+  expect(usage?.querySelector(".ci-task-token-usage")?.getAttribute("title")).toContain("11,522,554 Token");
+  const meters = [...usage!.querySelectorAll('[role="meter"]')];
+  expect(meters.map((meter) => meter.getAttribute("aria-label"))).toEqual(["5 小时剩余额度降幅", "7 天剩余额度降幅"]);
+  expect(meters.map((meter) => meter.getAttribute("aria-valuetext"))).toEqual(["减少 20 个百分点", "减少 3 个百分点"]);
+  expect(meters.map((meter) => meter.querySelector("strong")?.textContent)).toEqual(["−20 点", "−3 点"]);
+  expect(meters.map((meter) => (meter.querySelector(".ci-task-quota-track > span") as HTMLElement).style.width)).toEqual(["20%", "3%"]);
+  expect(container.querySelectorAll(".ci-task-usage")).toHaveLength(1);
+});
+it("keeps the synced file names in the card details", async () => {
+  mockRecords();
+  const read = vi.mocked(invoke).getMockImplementation()!;
+  const fileEvidence = "Codex 已修改：Board.tsx、board.css";
+  vi.mocked(invoke).mockImplementation((command, args) => command === "get_chat_sync_tasks"
+    ? Promise.resolve(insightSources.map((source) => source.noteId === 3 ? { ...source, evidence: fileEvidence } : source))
+    : read(command, args));
+  await render();
+  const card = container.querySelector(".ci-completed .ci-task")!;
+  expect(card.textContent).not.toMatch(/Board\.tsx|board\.css/);
+  await act(async () => card.querySelector<HTMLButtonElement>(".ci-task-open")!.click());
+  const details = document.querySelector<HTMLDetailsElement>(".ci-editor-dialog .ci-editor-sources")!;
+  await act(async () => details.querySelector("summary")!.click());
+  expect(details.open).toBe(true);
+  expect(details.querySelector("blockquote")?.textContent).toBe(fileEvidence);
+});
 it("opens the editor from the card surface and provides its synced evidence", async () => {
   mockRecords(); await render();
   expect(container.querySelectorAll(".ci-task")).toHaveLength(3);
@@ -288,7 +497,9 @@ it("adds the first item directly inside the selected project's pending column", 
   const trigger = () => pending().querySelector<HTMLButtonElement>(".ci-add-task")!;
   const form = () => pending().querySelector<HTMLFormElement>(".ci-create-task")!;
   await act(async () => trigger().click());
-  const firstInput = form().querySelector<HTMLTextAreaElement>("textarea")!;
+  const firstInput = form().querySelector<HTMLInputElement>('input[aria-label="Codex 提示词"]')!;
+  expect(firstInput.type).toBe("text");
+  expect(firstInput.hasAttribute("placeholder")).toBe(false);
   expect(document.activeElement).toBe(firstInput);
   await act(async () => firstInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
   expect(form()).toBeNull();
@@ -332,7 +543,11 @@ it("closes a blank composer and saves a filled one without overriding the clicke
   expect(invoke).not.toHaveBeenCalledWith("create_chat_board_task", expect.anything());
 
   await act(async () => trigger().click());
-  await enterTaskContent(form(), "记录测试结果\n\n补上两条说明");
+  const input = form().querySelector<HTMLInputElement>("input")!;
+  const paste = new Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(paste, "clipboardData", { value: { getData: () => "记录测试结果\r\n \r\n补上两条说明" } });
+  await act(async () => input.dispatchEvent(paste));
+  expect(input.value).toBe("记录测试结果 补上两条说明");
   const picker = filterTrigger("待处理事项项目");
   await act(async () => picker.click());
   const projectOption = filterOptions(picker).find((option) => option.textContent === "还没有事项的项目")!;
@@ -344,7 +559,7 @@ it("closes a blank composer and saves a filled one without overriding the clicke
   expect(picker.textContent).toBe("还没有事项的项目");
   expect(invoke).not.toHaveBeenCalledWith("create_chat_board_task", expect.anything());
   await act(async () => projects[0].click());
-  expect(invoke).toHaveBeenCalledWith("create_chat_board_task", { title: "记录测试结果", details: "补上两条说明", projectId: "empty" });
+  expect(invoke).toHaveBeenCalledWith("create_chat_board_task", { title: "记录测试结果 补上两条说明", details: "", projectId: "empty" });
   expect(invoke).not.toHaveBeenCalledWith("send_chat_board_task", expect.anything());
   expect(form()).toBeNull();
   expect(projects[0].getAttribute("aria-pressed")).toBe("true");
@@ -364,7 +579,7 @@ it("retains composer text after an outside save fails and avoids submitting twic
   await render();
   await act(async () => container.querySelector<HTMLButtonElement>(".ci-add-task")!.click());
   const form = container.querySelector<HTMLFormElement>(".ci-create-task")!;
-  const input = form.querySelector("textarea")!;
+  const input = form.querySelector("input")!;
   const outside = container.querySelector<HTMLElement>(".ci-header h1")!;
   await enterTaskContent(form, "要保存的事项");
   await act(async () => { outside.click(); outside.click(); });
@@ -411,22 +626,23 @@ it("adds a pending item, sends it in a new conversation, or lets the user choose
   await render(() => manual);
   await act(async () => container.querySelector<HTMLButtonElement>(".ci-add-task")!.click());
   const form = container.querySelector<HTMLFormElement>(".ci-create-task")!;
-  await enterTaskContent(form, "补齐接口文档\n补上两个示例");
+  const prompt = "补齐接口文档，补上两个示例";
+  await enterTaskContent(form, prompt);
   const project = filterTrigger("待处理事项项目");
   await act(async () => project.click());
   await act(async () => filterOptions(project).find((option) => option.textContent === "开发工具")!.click());
   await act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
-  expect(invoke).toHaveBeenCalledWith("create_chat_board_task", { title: "补齐接口文档", details: "补上两个示例", projectId: "app" });
-  const findCard = (column: string) => [...container.querySelectorAll(`.ci-${column} .ci-task`)].find((item) => item.textContent?.includes("补齐接口文档"))!;
+  expect(invoke).toHaveBeenCalledWith("create_chat_board_task", { title: prompt, details: "", projectId: "app" });
+  const findCard = (column: string) => [...container.querySelectorAll(`.ci-${column} .ci-task`)].find((item) => item.textContent?.includes(prompt))!;
   const card = findCard("todo");
   expect(card.textContent).toContain("补上两个示例");
   expect(invoke).not.toHaveBeenCalledWith("send_chat_board_task", expect.anything());
-  await act(async () => card.querySelector<HTMLButtonElement>('[aria-label="开启新对话 补齐接口文档"]')!.click());
+  await act(async () => card.querySelector<HTMLButtonElement>(`[aria-label="开启新对话 ${prompt}"]`)!.click());
   expect(invoke).toHaveBeenCalledWith("send_chat_board_task", { noteId: 5, threadId: null, projectId: "app" });
   expect(invoke).not.toHaveBeenCalledWith("open_chat_board_thread", expect.anything());
   expect(findCard("todo")).toBeUndefined();
   expect(findCard("doing").querySelector('[role="status"]')?.textContent).toBe("Codex 处理中");
-  await act(async () => findCard("doing").querySelector<HTMLButtonElement>('[aria-label="在 Codex 中查看 补齐接口文档"]')!.click());
+  await act(async () => findCard("doing").querySelector<HTMLButtonElement>(`[aria-label="在 Codex 中查看 ${prompt}"]`)!.click());
   expect(invoke).toHaveBeenCalledWith("open_chat_board_thread", { threadId: "new-thread" });
   expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "send_chat_board_task")).toHaveLength(1);
 
@@ -435,7 +651,7 @@ it("adds a pending item, sends it in a new conversation, or lets the user choose
   manual[0] = { ...manual[0], status: "todo" };
   source.dispatchState = null;
   await render(() => manual);
-  await act(async () => findCard("todo").querySelector<HTMLButtonElement>('[aria-label="沿用之前对话 补齐接口文档"]')!.click());
+  await act(async () => findCard("todo").querySelector<HTMLButtonElement>(`[aria-label="沿用之前对话 ${prompt}"]`)!.click());
   expect(document.querySelector(".ci-editor-dialog")).toBeNull();
   const dialog = document.querySelector<HTMLElement>('[role="dialog"][aria-label="选择 Codex 对话"]')!;
   const options = () => [...dialog.querySelectorAll<HTMLInputElement>('[role="radiogroup"] input')];
@@ -467,9 +683,14 @@ it("adds a pending item, sends it in a new conversation, or lets the user choose
   manual[0] = { ...manual[0], status: "completed", completed: true };
   source.dispatchState = "completed";
   await render(() => manual);
-  expect(findCard("completed")).toBeDefined();
-  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="在 Codex 中查看 补齐接口文档"]')!.click());
+  const completed = findCard("completed");
+  const view = completed.querySelector<HTMLButtonElement>(`.ci-task-actions [aria-label="在 Codex 中查看 ${prompt}"]`)!;
+  expect(view.textContent).toBe("");
+  expect(view.title).toBe("在 Codex 中查看");
+  expect(completed.querySelector(".ci-task-dispatch")).toBeNull();
+  await act(async () => view.click());
   expect(invoke).toHaveBeenLastCalledWith("open_chat_board_thread", { threadId: "existing-thread" });
+  expect(document.querySelector(".ci-editor-dialog")).toBeNull();
   expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "send_chat_board_task")).toHaveLength(2);
 });
 it.each([
@@ -507,7 +728,7 @@ it.each([
   const form = container.querySelector<HTMLFormElement>(".ci-create-task")!;
   const button = [...form.querySelectorAll("button")].find(({ textContent }) => textContent === action)!;
   expect(button.disabled).toBe(true);
-  await enterTaskContent(form, "  补齐接口文档\n\n补两个示例\n保留换行  ");
+  await enterTaskContent(form, "  补齐接口文档并补两个示例  ");
   await act(async () => button.click());
 
   if (threadId) {
@@ -527,7 +748,7 @@ it.each([
   const actions = vi.mocked(invoke).mock.calls.filter(([command]) =>
     command === "create_chat_board_task" || command === "send_chat_board_task");
   expect(actions).toEqual([
-    ["create_chat_board_task", { title: "补齐接口文档", details: "补两个示例\n保留换行", projectId: "app" }],
+    ["create_chat_board_task", { title: "补齐接口文档并补两个示例", details: "", projectId: "app" }],
     ["send_chat_board_task", { noteId: 5, threadId, projectId: "app" }]
   ]);
   expect(form.isConnected).toBe(false);
@@ -595,7 +816,8 @@ it("shows tasks by status without drag controls", async () => {
   expect(container.querySelector(".ci-completed .ci-task-open strong")?.textContent).toBe("看板设计");
   const completion = container.querySelector<HTMLTimeElement>(".ci-completed .ci-task time");
   expect(completion?.dateTime).toBe(completedAt);
-  expect(completion?.textContent).toBe("完成于 2026-11-19 14:05");
+  expect(completion?.textContent).toBe("11-19 14:05");
+  expect(completion?.title).toBe("完成于 2026-11-19 14:05");
   expect(container.querySelector('.ci-task [aria-label^="拖动事项"]')).toBeNull();
 });
 it("filters tasks by text and provides a reset when nothing matches", async () => {

@@ -1,4 +1,4 @@
-use crate::{codex_dispatch::{self, Delivery, Dispatch, ThreadPage, TurnOutcome, QUEUE_RECEIPT_PREFIX}, codex_projects::ProjectCatalog};
+use crate::{codex_dispatch::{self, Delivery, Dispatch, ThreadPage, TurnOutcome, QUEUE_RECEIPT_PREFIX}, codex_projects::ProjectCatalog, codex_usage::{self, TurnUsage}};
 use chrono::{Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS chat_sync_hidden_projects(project_id TEXT PRIMARY KEY
 CREATE TABLE IF NOT EXISTS chat_sync_archived_tasks(note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS chat_board_manual_tasks(note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
  project_id TEXT, created_at TEXT NOT NULL, last_thread_id TEXT);
+CREATE TABLE IF NOT EXISTS chat_board_prompt_details(note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS chat_board_dispatches(note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
  thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('running','completed','failed')));
 ";
@@ -149,6 +150,12 @@ pub struct TaskSource {
     project_id: Option<String>,
     dispatch_thread_id: Option<String>,
     dispatch_state: Option<String>,
+    #[serde(skip)]
+    usage_turn_id: Option<String>,
+    #[serde(skip)]
+    dispatch_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_usage: Option<TurnUsage>,
 }
 
 fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
@@ -156,7 +163,7 @@ fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
         .prepare(
             "SELECT l.note_id,l.session,h.evidence,json_extract(h.after_json,'$.updated_at'),
            EXISTS(SELECT 1 FROM chat_sync_archived_tasks a WHERE a.note_id=l.note_id),0,NULL,
-           d.thread_id,d.state,h.id AS position
+           d.thread_id,d.state,h.id AS position,substr(h.batch,length(l.session)+2),d.turn_id
          FROM chat_sync_links l JOIN notes n ON n.id=l.note_id
          LEFT JOIN chat_board_dispatches d ON d.note_id=n.id
          JOIN chat_sync_history h ON h.id=(
@@ -167,7 +174,7 @@ fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
          UNION ALL
          SELECT m.note_id,COALESCE(m.last_thread_id,''),'',m.created_at,
            EXISTS(SELECT 1 FROM chat_sync_archived_tasks a WHERE a.note_id=m.note_id),1,m.project_id,
-           d.thread_id,d.state,0
+           d.thread_id,d.state,0,NULL,d.turn_id
          FROM chat_board_manual_tasks m JOIN notes n ON n.id=m.note_id
          LEFT JOIN chat_board_dispatches d ON d.note_id=n.id
          ORDER BY position DESC",
@@ -185,6 +192,9 @@ fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
                 project_id: row.get(6)?,
                 dispatch_thread_id: row.get(7)?,
                 dispatch_state: row.get(8)?,
+                usage_turn_id: row.get(10)?,
+                dispatch_turn_id: row.get(11)?,
+                codex_usage: None,
             })
         })
         .map_err(db_error)?;
@@ -192,26 +202,47 @@ fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
 }
 
 #[tauri::command]
-pub fn get_chat_sync_tasks(app: tauri::AppHandle) -> Result<Vec<TaskSource>, String> {
+pub async fn get_chat_sync_tasks(app: tauri::AppHandle) -> Result<Vec<TaskSource>, String> {
     let (_, database) = paths(&app)?;
-    task_sources(&connect(&database)?)
+    let home = codex_home(&app).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut sources = task_sources(&connect(&database)?)?;
+        if let Some(home) = home {
+            for source in &mut sources {
+                let read_usage = |thread: &str, turn: &str| codex_usage::for_turn(&home, thread, turn);
+                source.codex_usage = source.dispatch_thread_id.as_deref().zip(source.dispatch_turn_id.as_deref())
+                    .filter(|(_, turn)| !turn.starts_with(QUEUE_RECEIPT_PREFIX) && source.dispatch_state.as_deref() != Some("running"))
+                    .and_then(|(thread, turn)| read_usage(thread, turn))
+                    .or_else(|| source.usage_turn_id.as_deref().filter(|id| !id.is_empty())
+                        .and_then(|turn| read_usage(&source.session_id, turn)));
+            }
+        }
+        Ok(sources)
+    }).await.map_err(|_| "无法读取对话事项".to_owned())?
 }
 
 #[tauri::command]
-pub fn create_chat_board_task(
+pub async fn create_chat_board_task(
     app: tauri::AppHandle, title: String, details: String, project_id: Option<String>,
 ) -> Result<TaskSource, String> {
     let database = board_database(&app)?;
     let cwd = project_id.as_deref().map(|id| board_project_root(&app, id)).transpose()?;
-    create_board_task(&mut connect(&database)?, &title, &details, project_id, cwd.as_deref())
+    if title.trim().is_empty() { return Err("请输入事项标题".into()); }
+    let generated = super::sync_analysis::suggest_card_title(&task_prompt(title.trim(), details.trim())).await;
+    create_board_task(&mut connect(&database)?, &title, &details, project_id, cwd.as_deref(), generated.as_deref())
 }
 
 fn create_board_task(
     db: &mut Connection, title: &str, details: &str, project_id: Option<String>, cwd: Option<&Path>,
+    generated_title: Option<&str>,
 ) -> Result<TaskSource, String> {
     let title = title.trim();
     if title.is_empty() { return Err("请输入事项标题".into()); }
     let details = details.trim();
+    let generated_title = generated_title.filter(|generated| *generated != title);
+    let original_prompt = generated_title.map(|_| task_prompt(title, details));
+    let title = generated_title.unwrap_or(title);
+    let details = original_prompt.as_deref().unwrap_or(details);
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(db_error)?;
     let category = project_category(&tx, cwd.and_then(Path::to_str), &now)?;
@@ -223,8 +254,12 @@ fn create_board_task(
     ).map_err(db_error)?;
     let note_id = tx.last_insert_rowid();
     tx.execute("INSERT INTO chat_board_manual_tasks(note_id,project_id,created_at) VALUES(?1,?2,?3)", params![note_id, project_id, now]).map_err(db_error)?;
+    if original_prompt.is_some() {
+        tx.execute("INSERT INTO chat_board_prompt_details(note_id) VALUES(?1)", [note_id]).map_err(db_error)?;
+    }
     tx.commit().map_err(db_error)?;
-    Ok(TaskSource { note_id, session_id: String::new(), evidence: String::new(), synced_at: Some(now), archived: false, manual: true, project_id, dispatch_thread_id: None, dispatch_state: None })
+    Ok(TaskSource { note_id, session_id: String::new(), evidence: String::new(), synced_at: Some(now), archived: false, manual: true,
+        project_id, dispatch_thread_id: None, dispatch_state: None, usage_turn_id: None, dispatch_turn_id: None, codex_usage: None })
 }
 
 #[tauri::command]
@@ -355,19 +390,22 @@ fn start_board_task(
     Ok((delivery, saved))
 }
 
+fn task_prompt(title: &str, details: &str) -> String {
+    if details.trim().is_empty() { title.to_owned() } else { format!("{title}\n\n{details}") }
+}
+
 fn board_task_prompt(db: &Connection, note_id: i64) -> Result<String, String> {
-    let (title, details): (String, Option<String>) = db.query_row(
-        "SELECT COALESCE(NULLIF(n.title,''),n.content),n.details FROM notes n
+    let (title, details, prompt_in_details): (String, Option<String>, bool) = db.query_row(
+        "SELECT COALESCE(NULLIF(n.title,''),n.content),n.details,
+          EXISTS(SELECT 1 FROM chat_board_prompt_details WHERE note_id=n.id) FROM notes n
          WHERE n.id=?1 AND n.status='todo' AND n.completed=0
          AND NOT EXISTS (SELECT 1 FROM chat_sync_archived_tasks WHERE note_id=n.id)
          AND (EXISTS (SELECT 1 FROM chat_board_manual_tasks WHERE note_id=n.id)
            OR EXISTS (SELECT 1 FROM chat_sync_links WHERE note_id=n.id))",
-        [note_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        [note_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional().map_err(db_error)?.ok_or("只有看板中未归档的待处理事项可以发送")?;
-    Ok(match details.filter(|text| !text.trim().is_empty()) {
-        Some(details) => format!("{title}\n\n{details}"),
-        None => title,
-    })
+    let details = details.as_deref().unwrap_or("");
+    Ok(if prompt_in_details && !details.trim().is_empty() { details.to_owned() } else { task_prompt(&title, details) })
 }
 
 fn record_board_dispatch(db: &mut Connection, note_id: i64, thread_id: &str, turn_id: &str) -> Result<(), String> {
@@ -524,6 +562,14 @@ pub struct BoardProjects {
     session_projects: BTreeMap<String, String>,
 }
 
+impl BoardProjects {
+    fn project_for<'a>(&'a self, catalog: &'a ProjectCatalog, session: &str, cwd: Option<&str>) -> Option<&'a str> {
+        catalog.project_for_with_preference(session, cwd, |id| {
+            self.projects.iter().any(|project| project.id == id && !project.hidden)
+        }).or_else(|| self.session_projects.get(session).map(String::as_str))
+    }
+}
+
 fn read_board_projects(db: &Connection, catalog: &ProjectCatalog) -> Result<BoardProjects, String> {
     let mut query = db.prepare(
         "SELECT project_id, display_name, tracked FROM chat_sync_project_settings",
@@ -556,7 +602,8 @@ fn read_board_projects(db: &Connection, catalog: &ProjectCatalog) -> Result<Boar
     while let Some(row) = rows.next().map_err(db_error)? {
         let session: String = row.get(0).map_err(db_error)?;
         let cwd: Option<String> = row.get(1).map_err(db_error)?;
-        if let Some(project_id) = catalog.project_for(&session, cwd.as_deref()) {
+        // An equally specific duplicate removed from the board should not block a visible project.
+        if let Some(project_id) = catalog.project_for_with_preference(&session, cwd.as_deref(), |id| !hidden.contains(id)) {
             session_projects.insert(session, project_id.to_owned());
         }
     }
@@ -568,6 +615,40 @@ pub fn get_chat_sync_projects(app: tauri::AppHandle) -> Result<BoardProjects, St
     let (_, database) = paths(&app)?;
     let catalog = ProjectCatalog::read(&codex_home(&app)?)?;
     read_board_projects(&connect(&database)?, &catalog)
+}
+
+#[tauri::command]
+pub async fn get_chat_sync_project_usage(
+    app: tauri::AppHandle,
+) -> Result<Vec<codex_usage::SessionUsageSummary>, String> {
+    let (_, database) = paths(&app)?;
+    let home = codex_home(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ProjectCatalog::read(&home)?;
+        let board = read_board_projects(&connect(&database)?, &catalog)?;
+        codex_usage::summarize_sessions(&home, |session, cwd| {
+            board.project_for(&catalog, session, cwd).map(str::to_owned)
+        })
+    }).await.map_err(|_| "无法读取项目用量".to_owned())?
+}
+
+#[tauri::command]
+pub async fn analyze_chat_project_requirements(
+    app: tauri::AppHandle, project_id: String,
+) -> Result<super::sync_analysis::RepeatedRequirements, String> {
+    let (_, database) = paths(&app)?;
+    let home = codex_home(&app)?;
+    let requests = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ProjectCatalog::read(&home)?;
+        if !catalog.contains(&project_id) {
+            return Err("找不到所选的 Codex 项目".to_owned());
+        }
+        let board = read_board_projects(&connect(&database)?, &catalog)?;
+        Ok(codex_usage::recent_project_requests(&home, |session, cwd| {
+            board.project_for(&catalog, session, cwd) == Some(project_id.as_str())
+        }))
+    }).await.map_err(|_| "无法读取项目对话".to_owned())??;
+    super::sync_analysis::analyze_project_requests(&requests).await
 }
 
 #[tauri::command]
@@ -1041,11 +1122,19 @@ fn project_category(db: &Connection, cwd: Option<&str>, now: &str) -> Result<i64
     .map_err(db_error)
 }
 
+fn board_has_turn(db: &Connection, job: &Job) -> Result<bool, String> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM chat_board_dispatches WHERE thread_id=?1 AND turn_id=?2)",
+        params![job.session_id, job.turn_id], |row| row.get(0),
+    ).map_err(db_error)
+}
+
 fn apply(
     db: &mut Connection,
     job: &Job,
     actions: Vec<Action>,
     expected: &[Value],
+    code_title: Option<String>,
 ) -> Result<usize, String> {
     let tx = db
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1061,15 +1150,16 @@ fn apply(
     let mut keys = std::collections::HashSet::new();
     let batch = format!("{}:{}", job.session_id, job.turn_id);
     let mut changed = 0;
-    let mut code_action = code_change_action(job, previous).map(|action| (action, true));
-    if code_action.is_some() && tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM chat_board_dispatches WHERE thread_id=?1 AND turn_id=?2)",
-        params![job.session_id, job.turn_id], |row| row.get::<_, bool>(0),
-    ).map_err(db_error)? {
+    let mut code_action = code_change_action(job, previous);
+    if code_action.is_some() && board_has_turn(&tx, job)? {
         // The board already has an item for this exact turn.
         code_action = None;
     }
-    for (action, is_code_change) in actions.into_iter().map(|action| (action, false)).chain(code_action) {
+    if let (Some(action), Some(title)) = (&mut code_action, code_title) {
+        action.title = Some(title);
+    }
+    for (action, is_code_change) in actions.into_iter().map(|action| (action, false))
+        .chain(code_action.map(|action| (action, true))) {
         if action.confidence < 0.9 {
             continue;
         }
@@ -1271,19 +1361,24 @@ fn apply(
 async fn process_file(root: &Path, database: &Path, file: &Path) -> Result<usize, String> {
     process_file_with(root, database, file, |input| async move {
         super::sync_analysis::analyze_conversation(&input, INSTRUCTIONS).await
+    }, |input| async move {
+        super::sync_analysis::suggest_card_title(&input).await
     })
     .await
 }
 
-async fn process_file_with<F, Fut>(
+async fn process_file_with<F, Fut, N, NameFuture>(
     root: &Path,
     database: &Path,
     file: &Path,
     analyze: F,
+    name_card: N,
 ) -> Result<usize, String>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
+    N: FnOnce(String) -> NameFuture,
+    NameFuture: std::future::Future<Output = Option<String>>,
 {
     let enabled_generation = fs::read(root.join("enabled")).map_err(|_| "同步未开启")?;
     if fs::metadata(file).map_err(|_| "无法读取对话")?.len() > 96 * 1024 {
@@ -1300,6 +1395,12 @@ where
     let edited = job.code_change.as_ref().is_some_and(|change| change.index > previous);
     let new_user_messages: Vec<_> = job.messages.iter()
         .filter(|message| message.index > previous && message.role == "user").collect();
+    let naming_context = job.code_change.as_ref().filter(|_| edited).and_then(|change| {
+        let request = new_user_messages.iter().rev()
+            .find(|message| code_task_title([message.text.as_str()]) != "代码调整")
+            .or_else(|| new_user_messages.last())?;
+        Some(format!("请求\n{}\n\n改动文件\n{}", request.text, change.files.join("、")))
+    });
     let use_ai = !edited && if job.explicit_only {
         new_user_messages.iter().any(|message| requests_task_sync(&message.text))
     } else {
@@ -1341,10 +1442,19 @@ where
             }).await.map_err(|_| "无法检查 Codex 任务状态")?;
         }
     }
+    let code_title = if let Some(context) = naming_context {
+        if fs::read(root.join("enabled")).ok().as_ref() != Some(&enabled_generation) {
+            return Err("同步已关闭，未应用分析结果".into());
+        }
+        let already_tracked = board_has_turn(&connect(database)?, &job)?;
+        if already_tracked { None } else { name_card(context).await }
+    } else {
+        None
+    };
     if fs::read(root.join("enabled")).ok().as_ref() != Some(&enabled_generation) {
         return Err("同步已关闭，未应用分析结果".into());
     }
-    apply(&mut connect(database)?, &job, actions, &linked)
+    apply(&mut connect(database)?, &job, actions, &linked, code_title)
 }
 
 #[tauri::command]
@@ -1463,6 +1573,24 @@ fn undo(db: &mut Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apply(db: &mut Connection, job: &Job, actions: Vec<Action>, expected: &[Value]) -> Result<usize, String> {
+        super::apply(db, job, actions, expected, None)
+    }
+
+    #[test]
+    fn a_named_manual_card_keeps_the_complete_editable_codex_prompt() {
+        let mut db = db();
+        let note = create_board_task(&mut db, "请整理接口文档并补两个示例", "保留现有参数", None, None, Some("补齐接口文档")).unwrap();
+        let prompt = "请整理接口文档并补两个示例\n\n保留现有参数";
+        let card: Value = serde_json::from_str(&snapshot(&db, note.note_id).unwrap()).unwrap();
+        assert_eq!(card["title"], "补齐接口文档");
+        assert_eq!(card["details"], prompt);
+        assert_eq!(board_task_prompt(&db, note.note_id).unwrap(), prompt);
+        db.execute("UPDATE notes SET title='整理接口示例' WHERE id=?1", [note.note_id]).unwrap();
+        assert_eq!(board_task_prompt(&db, note.note_id).unwrap(), prompt);
+    }
+
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
@@ -1581,12 +1709,47 @@ mod tests {
     }
 
     #[test]
+    fn board_prefers_the_visible_project_for_unassigned_threads_with_duplicate_roots() {
+        let mut db = db();
+        let catalog = serde_json::from_value(json!({
+            "local-projects": {
+                "website": {"name":"website", "rootPaths":["C:/dev/website"]},
+                "duplicate": {"name":"website", "rootPaths":["C:/dev/website"]},
+                "parent": {"name":"dev", "rootPaths":["C:/dev"]}
+            },
+            "thread-project-assignments": {
+                "assigned": {"projectKind":"local", "projectId":"duplicate"}
+            }
+        })).unwrap();
+        for session in ["session", "assigned"] {
+            let mut edit = job("layout", 1, "优化这里的排版");
+            edit.session_id = session.into();
+            edit.cwd = Some(r"C:\dev\website\admin".into());
+            edit.code_change = Some(CodeChange { index: 2, files: vec!["layout.tsx".into()] });
+            assert_eq!(apply(&mut db, &edit, vec![], &[]).unwrap(), 1);
+        }
+
+        let before = read_board_projects(&db, &catalog).unwrap();
+        assert!(!before.session_projects.contains_key("session"));
+
+        set_project_hidden(&db, "duplicate", true).unwrap();
+        let after = read_board_projects(&db, &catalog).unwrap();
+        assert_eq!(after.session_projects.get("session").map(String::as_str), Some("website"));
+        assert_eq!(after.session_projects.get("assigned").map(String::as_str), Some("duplicate"));
+
+        set_project_hidden(&db, "duplicate", false).unwrap();
+        let restored = read_board_projects(&db, &catalog).unwrap();
+        assert_eq!(restored.session_projects, before.session_projects);
+    }
+
+    #[test]
     fn dashboard_sources_only_include_existing_tasks_and_active_evidence() {
         let mut connection = db();
         create(&mut connection);
         let sources = task_sources(&connection).unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].session_id, "session");
+        assert_eq!(sources[0].usage_turn_id.as_deref(), Some("1"));
         assert_eq!(sources[0].evidence, "明天给客户发报价");
         assert!(sources[0].synced_at.is_some());
         undo(&mut connection).unwrap();
@@ -1637,8 +1800,8 @@ mod tests {
     #[test]
     fn board_dispatches_move_to_doing_and_only_the_matching_turn_completes_them() {
         let mut db = db();
-        assert!(create_board_task(&mut db, "  ", "", None, None).is_err());
-        let task = create_board_task(&mut db, " 补齐接口文档 ", " 补两个示例 ", Some("app".into()), None).unwrap();
+        assert!(create_board_task(&mut db, "  ", "", None, None, None).is_err());
+        let task = create_board_task(&mut db, " 补齐接口文档 ", " 补两个示例 ", Some("app".into()), None, None).unwrap();
         let id = task.note_id;
         let state = |db: &Connection| serde_json::from_str::<Value>(&snapshot(db, id).unwrap()).unwrap();
         assert!(task.manual);
@@ -2053,12 +2216,12 @@ mod tests {
             let input:Value=serde_json::from_str(&input).unwrap();
             assert_eq!(input["cursor"],0);assert_eq!(input["messages"][0]["role"],"user");
             Ok(r#"{"actions":[{"task_key":"quote","title":"给客户发报价","evidence":"明天给客户发报价","confidence":0.99}]}"#.into())
-        })).unwrap();
+        }, |_| async { panic!("explicit sync already names its cards") })).unwrap();
         assert_eq!(changed, 1);
         let duplicate =
             tauri::async_runtime::block_on(process_file_with(&root, &database, &file, |_| async {
                 panic!("duplicate turn must not call AI")
-            }))
+            }, |_| async { panic!("duplicate turn must not call AI naming") }))
             .unwrap();
         assert_eq!(duplicate, 0);
         {
@@ -2074,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_and_code_change_turns_need_no_ai() {
+    fn code_change_names_are_optional_and_receive_only_the_relevant_request() {
         let root = std::env::temp_dir().join(format!(
             "sticky-sync-local-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
         ));
@@ -2088,14 +2251,20 @@ mod tests {
             }
         }
         let file = root.join("turn.json");
-        let process = |job: &Job| {
+        let process = |job: &Job, title: Option<&str>| {
             fs::write(&file, serde_json::to_string(job).unwrap()).unwrap();
+            let title = title.map(str::to_owned);
             tauri::async_runtime::block_on(process_file_with(&root, &database, &file, |_| async {
                 panic!("local sync must not call AI")
+            }, |input| async move {
+                if title.is_some() {
+                    assert_eq!(input, "请求\n请帮我把项目路径隐藏，指针悬浮的时候再出现吧\n\n改动文件\nBoard.tsx、board.css");
+                }
+                title
             })).unwrap()
         };
         let ordinary = Job { explicit_only: true, ..job("ordinary", 7, "这个页面为什么有两列？") };
-        assert_eq!(process(&ordinary), 0);
+        assert_eq!(process(&ordinary, None), 0);
         assert_eq!(cursor(&connect(&database).unwrap(), "session").unwrap(), 7);
 
         let mut edit = Job {
@@ -2105,9 +2274,9 @@ mod tests {
             ..job("edit", 8, "请帮我把项目路径隐藏，指针悬浮的时候再出现吧")
         };
         edit.messages.push(Message { index: 9, role: "user".into(), text: "好，继续吧".into() });
-        assert_eq!(process(&edit), 1);
+        assert_eq!(process(&edit, None), 1);
         edit.code_change.as_mut().unwrap().index = 12;
-        assert_eq!(process(&edit), 0);
+        assert_eq!(process(&edit, None), 0);
         let mut db = connect(&database).unwrap();
         let note: (String, String, String) = db.query_row(
             "SELECT n.title,n.status,c.name FROM notes n JOIN categories c ON c.id=n.category_id", [],
@@ -2120,6 +2289,13 @@ mod tests {
         assert_eq!(cursor(&db, "session").unwrap(), 10);
         undo(&mut db).unwrap();
         assert!(task_sources(&db).unwrap().is_empty());
+        edit.turn_id = "named".into();
+        edit.messages[0].index = 13;
+        edit.messages[1].index = 14;
+        edit.code_change.as_mut().unwrap().index = 15;
+        assert_eq!(process(&edit, Some("悬停显示项目路径")), 1);
+        assert_eq!(db.query_row::<String, _, _>("SELECT title FROM notes", [], |row| row.get(0)).unwrap(),
+            "悬停显示项目路径");
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2212,6 +2388,7 @@ mod tests {
                 fs::remove_file(root.join("enabled")).unwrap();
                 Ok(r#"{"actions":[{"task_key":"quote","title":"给客户发报价","evidence":"明天给客户发报价","confidence":0.99}]}"#.into())
             },
+            |_| async { None },
         ));
         assert!(result.is_err());
         {

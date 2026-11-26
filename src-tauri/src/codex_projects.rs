@@ -56,6 +56,15 @@ impl ProjectCatalog {
     }
 
     pub fn project_for(&self, session: &str, cwd: Option<&str>) -> Option<&str> {
+        self.project_for_with_preference(session, cwd, |_| false)
+    }
+
+    pub fn project_for_with_preference(
+        &self,
+        session: &str,
+        cwd: Option<&str>,
+        preferred: impl Fn(&str) -> bool,
+    ) -> Option<&str> {
         if let Some(assignment) = self.thread_project_assignments.get(session) {
             if assignment.project_kind == "local" && self.contains(&assignment.project_id) {
                 return Some(&assignment.project_id);
@@ -75,11 +84,12 @@ impl ProjectCatalog {
                 {
                     continue;
                 }
+                let rank = (root.len(), preferred(id));
                 match best {
-                    Some((_, length)) if length > root.len() => {}
-                    Some((other, length)) if length == root.len() => ambiguous |= other != id,
+                    Some((_, current)) if current > rank => {}
+                    Some((other, current)) if current == rank => ambiguous |= other != id,
                     _ => {
-                        best = Some((id, root.len()));
+                        best = Some((id, rank));
                         ambiguous = false;
                     }
                 }

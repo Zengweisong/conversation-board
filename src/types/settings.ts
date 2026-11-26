@@ -1,6 +1,5 @@
 import type { NoteTimeFilter } from "./filter";
 
-export type ThemeName = "warm" | "light" | "dark" | "green";
 export const MIN_FONT_SIZE = 14;
 export const MAX_FONT_SIZE = 18;
 export type ViewMode = "list" | "board" | "calendar" | "insights";
@@ -17,9 +16,14 @@ export interface WindowState {
   scaleFactor: number | null;
 }
 
-export interface AppSettings {
+export interface AppearanceSettings {
+  darkMode: boolean;
+  themeColor: string | null;
+  savedThemeColors: string[];
+}
+
+export interface AppSettings extends AppearanceSettings {
   opacity: number;
-  theme: ThemeName;
   alwaysOnTop: boolean;
   launchOnStartup: boolean;
   showOnStartup: boolean;
@@ -46,7 +50,9 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   opacity: 92,
-  theme: "warm",
+  darkMode: false,
+  themeColor: null,
+  savedThemeColors: [],
   alwaysOnTop: true,
   launchOnStartup: false,
   showOnStartup: true,

@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowUpRight, Check, ChevronDown, CircleAlert, Clock3, Folder, MessagesSquare, Plus, Search, X } from "lucide-react";
@@ -27,9 +27,11 @@ interface Props {
   canSend: boolean;
   dispatchState: ChatTaskSource["dispatchState"];
   onSent: () => Promise<void>;
+  completion: ReactNode;
+  cardActions: ReactNode;
 }
 
-export function ConversationTaskDispatch({ noteId, title, projectId, projectLabel, preferredThreadId, disabled, canSend, dispatchState, onSent }: Props) {
+export function ConversationTaskDispatch({ noteId, title, projectId, projectLabel, preferredThreadId, disabled, canSend, dispatchState, onSent, completion, cardActions }: Props) {
   const [choosing, setChoosing] = useState(false);
   const [sending, setSending] = useState(false);
   const [message, setMessage] = useState("");
@@ -77,29 +79,37 @@ export function ConversationTaskDispatch({ noteId, title, projectId, projectLabe
     setChoosing(false); setError("");
   };
 
-  return <div className="ci-task-dispatch" ref={actions}>
-    {dispatchState === "running" && <span className="ci-dispatch-state is-running" role="status"><Clock3 size={13} aria-hidden="true" />Codex 处理中</span>}
-    {dispatchState === "failed" && <span className="ci-dispatch-state is-failed" role="status"><CircleAlert size={13} aria-hidden="true" />Codex 未完成</span>}
-    {message && <small role="status">{message}</small>}
-    <div className="ci-send-buttons" role="group" aria-label="Codex 对话">
-      {canSend && <>
+  return <>
+    {(canSend || dispatchState === "running" || dispatchState === "failed" || message || error || openError) && <div className="ci-task-dispatch" ref={actions}>
+      {dispatchState === "running" && <span className="ci-dispatch-state is-running" role="status"><Clock3 size={13} aria-hidden="true" />Codex 处理中</span>}
+      {dispatchState === "failed" && <span className="ci-dispatch-state is-failed" role="status"><CircleAlert size={13} aria-hidden="true" />Codex 未完成</span>}
+      {message && <small role="status">{message}</small>}
+      {canSend && <div className="ci-send-buttons" role="group" aria-label="Codex 对话">
         <button type="button" className="ci-send-new" disabled={disabled || sending} title="发送给 Codex"
           aria-label={`开启新对话 ${title}`} onClick={() => void send(null)}><Plus size={13} aria-hidden="true" />{sending && !choosing ? "发送中…" : "开启新对话"}</button>
         <button type="button" ref={trigger} disabled={disabled || sending} title="发送给 Codex"
           aria-label={`沿用之前对话 ${title}`} onClick={() => { setError(""); setChoosing(true); }}>沿用之前对话</button>
-      </>}
-      {linkedThreadId && <button type="button" className="ci-view-thread" disabled={disabled || sending}
-        aria-label={`在 Codex 中查看 ${title}`} onClick={() => void openThread(linkedThreadId)}>在 Codex 中查看<ArrowUpRight size={13} aria-hidden="true" /></button>}
+      </div>}
+      {!choosing && error && <small className="ci-warning" role="alert">{error}</small>}
+      {openError && <small className="ci-warning" role="alert">{openError}</small>}
+    </div>}
+    <div className="ci-task-footer">
+      {completion}
+      <div className="ci-task-actions">
+        {linkedThreadId && <button type="button" className="ci-view-thread" title="在 Codex 中查看" disabled={disabled || sending}
+          aria-label={`在 Codex 中查看 ${title}`} onClick={() => void openThread(linkedThreadId)}>
+          <ArrowUpRight size={16} aria-hidden="true" />
+        </button>}
+        {cardActions}
+      </div>
     </div>
-    {!choosing && error && <small className="ci-warning" role="alert">{error}</small>}
-    {openError && <small className="ci-warning" role="alert">{openError}</small>}
     {choosing && createPortal(
       <CodexThreadPicker key={projectId} projectId={projectId} projectLabel={projectLabel}
         preferredId={linkedThreadId} sending={sending} sendError={error}
         onClose={close} onSend={(id) => void send(id)} />,
       actions.current?.closest(".app-shell") ?? document.body,
     )}
-  </div>;
+  </>;
 }
 
 export function CodexThreadPicker({ projectId, projectLabel, preferredId, sending, sendError, onClose, onSend }: {

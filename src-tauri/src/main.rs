@@ -4,6 +4,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 mod chat_sync;
+mod codex_usage;
 #[cfg(any(windows, test))]
 mod codex_desktop;
 mod codex_dispatch;
@@ -327,6 +328,8 @@ fn main() {
             chat_sync::refresh_chat_board_dispatches,
             chat_sync::set_chat_sync_task_archived,
             chat_sync::get_chat_sync_projects,
+            chat_sync::get_chat_sync_project_usage,
+            chat_sync::analyze_chat_project_requirements,
             chat_sync::save_chat_sync_project,
             chat_sync::set_chat_sync_project_hidden,
             chat_sync::configure_chat_sync,
@@ -337,6 +340,7 @@ fn main() {
             sync_analysis::get_sync_analysis_config,
             sync_analysis::save_sync_analysis_config,
             sync_analysis::clear_sync_analysis_config,
+            sync_analysis::set_ai_card_naming,
         ])
         .run(tauri::generate_context!())
         .expect("运行对话看板时发生错误");

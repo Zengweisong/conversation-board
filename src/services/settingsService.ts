@@ -3,14 +3,14 @@ import {
   DEFAULT_SETTINGS,
   MAX_FONT_SIZE,
   MIN_FONT_SIZE,
+  type AppearanceSettings,
   type AppSettings,
   type CloseAction,
-  type PriorityFilter,
-  type ThemeName
+  type PriorityFilter
 } from "../types/settings";
 import { isNoteTimeFilter } from "../types/filter";
+import { normalizeThemeColor } from "./themeColor";
 
-const THEMES = new Set<ThemeName>(["warm", "light", "dark", "green"]);
 const PRIORITIES = new Set<PriorityFilter>(["all", "low", "normal", "high"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -29,6 +29,10 @@ function coordinate(value: unknown): number | null {
 
 function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
+}
+
+function normalizedThemeColors(values: unknown[]): string[] {
+  return [...new Set(values.map(normalizeThemeColor).filter((color): color is string => color !== null))];
 }
 
 function categoryFilterId(value: unknown): number | null {
@@ -72,9 +76,13 @@ export function normalizeSettings(value: unknown): AppSettings {
   const currentWindow = normalizedWindow(savedWindow, DEFAULT_SETTINGS.window, hasSavedWindow);
   const legacyWindowIsUsable = typeof savedWindow.width === "number" && savedWindow.width > 0
     && typeof savedWindow.height === "number" && savedWindow.height > 0;
-  const theme = THEMES.has(saved.theme as ThemeName)
-    ? saved.theme as ThemeName
-    : DEFAULT_SETTINGS.theme;
+  const legacyDark = saved.theme === "dark" || saved.theme === "green";
+  const legacyColor = saved.theme === "green" ? "#97D4AB"
+    : saved.theme === "dark" ? "#79AFF0"
+    : saved.theme === "light" ? "#3478C9" : null;
+  const themeColor = normalizeThemeColor(saved.themeColor);
+  const savedThemeColors = Array.isArray(saved.savedThemeColors) ? normalizedThemeColors(saved.savedThemeColors)
+    : themeColor ? [themeColor] : [];
   const fontSizeCandidate = saved.fontSize ?? savedAppearance.fontSize;
   const fontSize = fontSizeCandidate === "small" ? MIN_FONT_SIZE
     : fontSizeCandidate === "large" ? MAX_FONT_SIZE
@@ -82,7 +90,9 @@ export function normalizeSettings(value: unknown): AppSettings {
 
   return {
     opacity: Math.round(Math.min(100, Math.max(0, opacity))),
-    theme,
+    darkMode: booleanValue(saved.darkMode, legacyDark),
+    themeColor: themeColor ?? (typeof saved.darkMode === "boolean" ? null : legacyColor),
+    savedThemeColors,
     alwaysOnTop: booleanValue(saved.alwaysOnTop, DEFAULT_SETTINGS.alwaysOnTop),
     launchOnStartup: booleanValue(saved.launchOnStartup, DEFAULT_SETTINGS.launchOnStartup),
     showOnStartup: booleanValue(saved.showOnStartup, DEFAULT_SETTINGS.showOnStartup),
@@ -181,12 +191,12 @@ async function patchSettings(changes: Partial<AppSettings>): Promise<void> {
   await operation;
 }
 
-export async function saveTheme(theme: ThemeName): Promise<void> {
+export async function saveAppearance({ darkMode, themeColor, savedThemeColors }: AppearanceSettings): Promise<void> {
   try {
-    await patchSettings({ theme });
+    await patchSettings({ darkMode, themeColor: normalizeThemeColor(themeColor), savedThemeColors: normalizedThemeColors(savedThemeColors) });
   } catch (error) {
-    console.error("保存主题失败:", error);
-    throw new Error("保存主题失败，请重试");
+    console.error("保存外观设置失败:", error);
+    throw new Error("保存外观设置失败，请重试");
   }
 }
 
