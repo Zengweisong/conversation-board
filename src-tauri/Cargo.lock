@@ -626,6 +626,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-sql",
  "tauri-winrt-notification",
+ "tokio",
  "uuid",
  "windows-sys 0.61.2",
 ]

@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::{Emitter, Manager};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager,
+};
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 mod chat_sync;
@@ -264,6 +268,41 @@ fn migrations() -> Vec<Migration> {
     ]
 }
 
+fn restore_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "tray-show", "打开对话看板", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", "退出对话看板", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let tray = TrayIconBuilder::new()
+        .tooltip("对话看板")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if matches!(event, TrayIconEvent::Click {
+                button: MouseButton::Left, button_state: MouseButtonState::Up, ..
+            }) {
+                restore_main_window(tray.app_handle());
+            }
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "tray-show" => restore_main_window(app),
+            "tray-quit" => {
+                let _ = app.emit_to("main", "tray-quit-requested", ());
+            }
+            _ => {}
+        });
+    let icon = app.default_window_icon().expect("无法加载托盘图标");
+    tray.icon(icon.clone()).build(app)?;
+    Ok(())
+}
+
 #[cfg(windows)]
 #[tauri::command]
 fn show_reminder_notification(
@@ -286,11 +325,7 @@ fn show_reminder_notification(
         .text1(&details)
         .text2(&context)
         .on_activated(move |_| {
-            if let Some(window) = activation_app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            restore_main_window(&activation_app);
             let _ = activation_app.emit("notification-activated", note_id);
             Ok(())
         })
@@ -318,9 +353,26 @@ fn main() {
                 .add_migrations("sqlite:desktop-notes.db", migrations())
                 .build(),
         )
+        .setup(|app| {
+            setup_tray(app)?;
+            chat_sync::start_chat_sync(app.handle());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            #[cfg(windows)]
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::Resized(_))
+                && window.is_minimized().unwrap_or(false)
+            {
+                let _ = window.hide();
+            }
+            #[cfg(not(windows))]
+            let _ = (window, event);
+        })
         .invoke_handler(tauri::generate_handler![
             chat_sync::get_chat_sync_status,
             chat_sync::get_chat_sync_tasks,
+            chat_sync::get_chat_task_activity,
             chat_sync::create_chat_board_task,
             chat_sync::list_chat_board_threads,
             chat_sync::open_chat_board_thread,
@@ -333,7 +385,6 @@ fn main() {
             chat_sync::save_chat_sync_project,
             chat_sync::set_chat_sync_project_hidden,
             chat_sync::configure_chat_sync,
-            chat_sync::process_chat_sync,
             chat_sync::retry_chat_sync,
             chat_sync::undo_chat_sync,
             show_reminder_notification,

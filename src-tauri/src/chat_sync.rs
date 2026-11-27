@@ -1,4 +1,4 @@
-use crate::{codex_dispatch::{self, Delivery, Dispatch, ThreadPage, TurnOutcome, QUEUE_RECEIPT_PREFIX}, codex_projects::ProjectCatalog, codex_usage::{self, TurnUsage}};
+use crate::{codex_dispatch::{self, Delivery, Dispatch, ThreadPage, TurnOutcome, QUEUE_RECEIPT_PREFIX}, codex_projects::ProjectCatalog, codex_usage::{self, TurnActivity, TurnUsage}};
 use chrono::{Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use tauri::{Emitter, Manager};
 
 static PROCESSING: AtomicBool = AtomicBool::new(false);
 static LEGACY_CODE_NOTES_CHECKED: AtomicBool = AtomicBool::new(false);
+static CONVERSATION_HISTORY_CHECKED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_BOARD_DISPATCHES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 const LEGACY_CODE_TITLE_PREFIX: &str = "跟进代码改动：";
 struct ProcessingGuard;
@@ -117,6 +118,7 @@ struct Action {
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
     enabled: bool,
+    startup_restart_needed: bool,
     pending: usize,
     failed: usize,
     last_error: Option<String>,
@@ -124,6 +126,8 @@ pub struct SyncStatus {
     recent: Vec<String>,
     can_undo: bool,
 }
+
+struct StartupSync(Result<bool, String>);
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LastAnalysis {
@@ -147,6 +151,7 @@ pub struct TaskSource {
     synced_at: Option<String>,
     archived: bool,
     manual: bool,
+    conversation: bool,
     project_id: Option<String>,
     dispatch_thread_id: Option<String>,
     dispatch_state: Option<String>,
@@ -163,7 +168,7 @@ fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
         .prepare(
             "SELECT l.note_id,l.session,h.evidence,json_extract(h.after_json,'$.updated_at'),
            EXISTS(SELECT 1 FROM chat_sync_archived_tasks a WHERE a.note_id=l.note_id),0,NULL,
-           d.thread_id,d.state,h.id AS position,substr(h.batch,length(l.session)+2),d.turn_id
+           d.thread_id,d.state,h.id AS position,substr(h.batch,length(l.session)+2),d.turn_id,l.task_key LIKE 'conversation:%'
          FROM chat_sync_links l JOIN notes n ON n.id=l.note_id
          LEFT JOIN chat_board_dispatches d ON d.note_id=n.id
          JOIN chat_sync_history h ON h.id=(
@@ -174,7 +179,7 @@ fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
          UNION ALL
          SELECT m.note_id,COALESCE(m.last_thread_id,''),'',m.created_at,
            EXISTS(SELECT 1 FROM chat_sync_archived_tasks a WHERE a.note_id=m.note_id),1,m.project_id,
-           d.thread_id,d.state,0,NULL,d.turn_id
+           d.thread_id,d.state,0,NULL,d.turn_id,0
          FROM chat_board_manual_tasks m JOIN notes n ON n.id=m.note_id
          LEFT JOIN chat_board_dispatches d ON d.note_id=n.id
          ORDER BY position DESC",
@@ -189,6 +194,7 @@ fn task_sources(db: &Connection) -> Result<Vec<TaskSource>, String> {
                 synced_at: row.get(3)?,
                 archived: row.get(4)?,
                 manual: row.get(5)?,
+                conversation: row.get(12)?,
                 project_id: row.get(6)?,
                 dispatch_thread_id: row.get(7)?,
                 dispatch_state: row.get(8)?,
@@ -219,6 +225,29 @@ pub async fn get_chat_sync_tasks(app: tauri::AppHandle) -> Result<Vec<TaskSource
         }
         Ok(sources)
     }).await.map_err(|_| "无法读取对话事项".to_owned())?
+}
+
+fn task_activity(db: &Connection, home: &Path, note_id: i64) -> Result<TurnActivity, String> {
+    let mut query = db.prepare(
+        "SELECT h.batch FROM chat_sync_history h JOIN notes n ON n.id=h.note_id
+         WHERE h.note_id=?1 AND h.undone=0
+         UNION
+         SELECT thread_id||':'||turn_id FROM chat_board_dispatches WHERE note_id=?1",
+    ).map_err(db_error)?;
+    let batches = query.query_map([note_id], |row| row.get::<_, String>(0)).map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>().map_err(db_error)?;
+    let turns = batches.iter().filter_map(|batch| batch.split_once(':')).filter(|(session, turn)| {
+        !session.is_empty() && !turn.is_empty() && !turn.starts_with(QUEUE_RECEIPT_PREFIX)
+    });
+    codex_usage::activity_for_turns(home, turns)
+}
+
+#[tauri::command]
+pub async fn get_chat_task_activity(app: tauri::AppHandle, note_id: i64) -> Result<TurnActivity, String> {
+    let (_, database) = paths(&app)?;
+    let home = codex_home(&app)?;
+    tauri::async_runtime::spawn_blocking(move || task_activity(&connect(&database)?, &home, note_id))
+        .await.map_err(|_| "无法读取调用记录".to_owned())?
 }
 
 #[tauri::command]
@@ -258,7 +287,7 @@ fn create_board_task(
         tx.execute("INSERT INTO chat_board_prompt_details(note_id) VALUES(?1)", [note_id]).map_err(db_error)?;
     }
     tx.commit().map_err(db_error)?;
-    Ok(TaskSource { note_id, session_id: String::new(), evidence: String::new(), synced_at: Some(now), archived: false, manual: true,
+    Ok(TaskSource { note_id, session_id: String::new(), evidence: String::new(), synced_at: Some(now), archived: false, manual: true, conversation: false,
         project_id, dispatch_thread_id: None, dispatch_state: None, usage_turn_id: None, dispatch_turn_id: None, codex_usage: None })
 }
 
@@ -779,11 +808,16 @@ pub fn get_chat_sync_status(app: tauri::AppHandle) -> Result<SyncStatus, String>
     } else {
         (vec![], None)
     };
+    let enabled = root.join("enabled").exists();
+    let startup = app.try_state::<StartupSync>();
+    let startup_error = startup.as_ref().and_then(|state| state.0.as_ref().err());
     Ok(SyncStatus {
-        enabled: root.join("enabled").exists(),
+        enabled,
+        startup_restart_needed: startup.as_ref().is_some_and(|state| matches!(state.0, Ok(true))),
         pending: queue_files(&root, "json").len(),
         failed: queue_files(&root, "failed").len(),
-        last_error: fs::read_to_string(root.join("last-error")).ok(),
+        last_error: startup_error.filter(|_| !enabled).cloned()
+            .or_else(|| fs::read_to_string(root.join("last-error")).ok()),
         last_analysis,
         can_undo: !recent.is_empty(),
         recent,
@@ -800,17 +834,26 @@ fn update_hook_script(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn install_hook(root: &Path, codex_home: &Path) -> Result<(), String> {
+fn read_hook_config(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("无法读取原 Hook 配置，未修改".into()),
+    }
+}
+
+fn install_hook(root: &Path, codex_home: &Path) -> Result<bool, String> {
     fs::create_dir_all(root.join("queue")).map_err(|_| "无法创建同步目录")?;
     fs::create_dir_all(codex_home).map_err(|_| "无法创建对话配置目录")?;
     update_hook_script(root)?;
     let script = root.join("chat-sync-hook.ps1");
     let config_path = codex_home.join("hooks.json");
-    let existing = fs::read_to_string(&config_path).ok();
-    let mut config: Value = match &existing {
+    let existing = read_hook_config(&config_path)?;
+    let original: Value = match &existing {
         Some(text) => serde_json::from_str(text).map_err(|_| "原 hooks.json 格式无效，未修改")?,
         None => json!({}),
     };
+    let mut config = original.clone();
     if !config.is_object() {
         return Err("原 hooks.json 必须是对象，未修改".into());
     }
@@ -842,8 +885,11 @@ fn install_hook(root: &Path, codex_home: &Path) -> Result<(), String> {
             .is_none_or(|handlers| !handlers.is_empty())
     });
     stop.push(json!({"hooks":[{"type":"command","command":command,"timeout":10}]}));
-    if fs::read_to_string(&config_path).ok() != existing {
+    if read_hook_config(&config_path)? != existing {
         return Err("Hook 配置被其他程序修改，请重试".into());
+    }
+    if config == original {
+        return Ok(false);
     }
     if let Some(text) = existing {
         fs::write(
@@ -858,32 +904,58 @@ fn install_hook(root: &Path, codex_home: &Path) -> Result<(), String> {
     write_atomic(
         &config_path,
         &serde_json::to_string_pretty(&config).map_err(|_| "同步设置序列化失败")?,
-    )
+    )?;
+    Ok(true)
+}
+
+fn set_chat_sync_enabled(app: &tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    let (root, _) = paths(app)?;
+    fs::create_dir_all(&root).map_err(|_| "无法创建同步目录")?;
+    let configuration_lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("configuration.lock"))
+        .map_err(|_| "无法锁定对话同步设置")?;
+    configuration_lock.lock().map_err(|_| "无法锁定对话同步设置")?;
+    let marker = root.join("enabled");
+    let already_enabled = marker.try_exists().map_err(|_| "无法读取同步状态")?;
+    if enabled {
+        if already_enabled {
+            return Ok(false);
+        }
+        let restart_needed = install_hook(&root, &codex_home(app)?)?;
+        write_atomic(&marker, &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+            .map_err(|_| "无法启用对话同步")?;
+        return Ok(restart_needed);
+    }
+    if already_enabled {
+        fs::remove_file(marker).map_err(|_| "无法关闭对话同步")?;
+    }
+    // Pending content is not replayed after the user later enables syncing again.
+    for file in queue_files(&root, "json")
+        .into_iter()
+        .chain(queue_files(&root, "failed"))
+    {
+        let _ = fs::remove_file(file);
+    }
+    Ok(false)
 }
 
 #[tauri::command]
-pub fn configure_chat_sync(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    let (root, _) = paths(&app)?;
-    if enabled {
-        install_hook(&root, &codex_home(&app)?)?;
-        fs::write(
-            root.join("enabled"),
-            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-        )
-        .map_err(|_| "无法启用对话同步")?;
-    } else {
-        if root.join("enabled").exists() {
-            fs::remove_file(root.join("enabled")).map_err(|_| "无法关闭对话同步")?;
+pub fn configure_chat_sync(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    set_chat_sync_enabled(&app, enabled)
+}
+
+pub fn start_chat_sync(app: &tauri::AppHandle) {
+    app.manage(StartupSync(set_chat_sync_enabled(app, true)));
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let _ = process_chat_sync(&app).await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
         }
-        // Pending content is not replayed after the user later enables syncing again.
-        for file in queue_files(&root, "json")
-            .into_iter()
-            .chain(queue_files(&root, "failed"))
-        {
-            let _ = fs::remove_file(file);
-        }
-    }
-    Ok(())
+    });
 }
 
 fn validate_job(job: &Job) -> Result<(), String> {
@@ -1085,7 +1157,7 @@ fn update_legacy_code_notes(db: &mut Connection) -> Result<usize, String> {
 }
 
 fn linked_tasks(db: &Connection, session: &str) -> Result<Vec<Value>, String> {
-    let mut stmt = db.prepare("SELECT l.task_key,n.id,n.title,n.status,n.updated_at,n.scheduled_date,n.scheduled_time FROM chat_sync_links l JOIN notes n ON n.id=l.note_id WHERE l.session=?1 AND n.repeat_series_id IS NULL").map_err(db_error)?;
+    let mut stmt = db.prepare("SELECT l.task_key,n.id,n.title,n.status,n.updated_at,n.scheduled_date,n.scheduled_time FROM chat_sync_links l JOIN notes n ON n.id=l.note_id WHERE l.session=?1 AND n.repeat_series_id IS NULL AND l.task_key NOT LIKE 'conversation:%'").map_err(db_error)?;
     let rows = stmt.query_map([session],|r| Ok(json!({"task_key":r.get::<_,String>(0)?,"id":r.get::<_,i64>(1)?,"title":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"updated_at":r.get::<_,String>(4)?,"scheduled_date":r.get::<_,Option<String>>(5)?,"scheduled_time":r.get::<_,Option<String>>(6)?}))).map_err(db_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
 }
@@ -1129,6 +1201,75 @@ fn board_has_turn(db: &Connection, job: &Job) -> Result<bool, String> {
     ).map_err(db_error)
 }
 
+fn record_conversation(
+    db: &Connection, session: &str, turn: &str, cwd: Option<&str>, request: &str, completed_at: &str,
+) -> Result<(), String> {
+    let compact = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let mut title: String = chars.by_ref().take(52).collect();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    let category_id = project_category(db, cwd, completed_at)?;
+    let inserted = db.execute(
+        "INSERT INTO notes(content,title,category_id,created_at,updated_at,sort_order,board_order,board_column_id,status,completed,completed_at)
+         SELECT ?1,?1,?2,?3,?3,(SELECT COALESCE(MAX(sort_order),0)+10 FROM notes),
+           (SELECT COALESCE(MAX(board_order),0)+10 FROM notes),id,'completed',1,?3
+         FROM board_columns WHERE status='completed' ORDER BY type='system' DESC,sort_order LIMIT 1",
+        params![title, category_id, completed_at],
+    ).map_err(db_error)?;
+    if inserted == 0 {
+        return Err("没有与目标状态对应的看板栏目".into());
+    }
+    let id = db.last_insert_rowid();
+    db.execute(
+        "INSERT INTO chat_sync_links(session,task_key,note_id) VALUES(?1,?2,?3)",
+        params![session, format!("conversation:{turn}"), id],
+    ).map_err(db_error)?;
+    db.execute(
+        "INSERT INTO chat_sync_history(batch,note_id,after_json,evidence) VALUES(?1,?2,?3,?4)",
+        params![format!("{session}:{turn}"), id, snapshot(db, id)?, request],
+    ).map_err(db_error)?;
+    Ok(())
+}
+
+fn backfill_conversation_records(db: &mut Connection, home: &Path) -> Result<(), String> {
+    const SETTING: &str = "chat-sync-conversation-history-v1";
+    if db.query_row("SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)", [SETTING], |row| row.get(0))
+        .map_err(db_error)? {
+        return Ok(());
+    }
+    let candidates = {
+        let mut query = db.prepare(
+            "SELECT e.session,e.turn FROM chat_sync_events e
+             LEFT JOIN (SELECT DISTINCT batch FROM chat_sync_history) h ON h.batch=e.session||':'||e.turn
+             LEFT JOIN chat_board_dispatches d ON d.thread_id=e.session AND d.turn_id=e.turn
+             WHERE h.batch IS NULL AND d.note_id IS NULL",
+        ).map_err(db_error)?;
+        let rows = query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(db_error)?;
+        let mut candidates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for row in rows {
+            let (session, turn) = row.map_err(db_error)?;
+            candidates.entry(session).or_default().insert(turn);
+        }
+        candidates
+    };
+    let mut history = codex_usage::completed_conversations(home, &candidates);
+    history.sort_by_key(|record| record.ended_at);
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(db_error)?;
+    for record in history {
+        if requests_task_sync(&record.request) {
+            continue;
+        }
+        let ended_at = record.ended_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        record_conversation(&tx, &record.session_id, &record.turn_id, record.cwd.as_deref(), &record.request, &ended_at)?;
+    }
+    tx.execute("INSERT INTO settings(key,value,updated_at) VALUES(?1,'true',?2)",
+        params![SETTING, Utc::now().to_rfc3339()]).map_err(db_error)?;
+    tx.commit().map_err(db_error)
+}
+
 fn apply(
     db: &mut Connection,
     job: &Job,
@@ -1168,7 +1309,7 @@ fn apply(
             || action.task_key.trim().is_empty()
             || action.task_key.len() > 200
             || !keys.insert(action.task_key.clone())
-            || (!is_code_change && (action.task_key.starts_with("code-change:")
+            || (!is_code_change && (action.task_key.starts_with("code-change:") || action.task_key.starts_with("conversation:")
                 || action.evidence.trim().chars().count() < 4
                 || !job.messages.iter().any(|m| {
                     m.index > previous && m.role == "user" && m.text.contains(action.evidence.trim())
@@ -1201,7 +1342,7 @@ fn apply(
         if linked.is_none() && !is_code_change {
             if let Some(title) = action.title.as_deref() {
                 // A model may choose a different key on a later turn. Do not duplicate an identical linked title.
-                linked=tx.query_row("SELECT l.note_id FROM chat_sync_links l JOIN notes n ON n.id=l.note_id WHERE l.session=?1 AND trim(n.title)=?2 LIMIT 1",params![job.session_id,title.trim()],|r|r.get(0)).optional().map_err(db_error)?;
+                linked=tx.query_row("SELECT l.note_id FROM chat_sync_links l JOIN notes n ON n.id=l.note_id WHERE l.session=?1 AND trim(n.title)=?2 AND l.task_key NOT LIKE 'conversation:%' LIMIT 1",params![job.session_id,title.trim()],|r|r.get(0)).optional().map_err(db_error)?;
             }
         }
         if linked == Some(None) {
@@ -1335,6 +1476,17 @@ fn apply(
         tx.execute("INSERT INTO chat_sync_history(batch,note_id,before_json,after_json,evidence) VALUES(?1,?2,?3,?4,?5)",params![batch,id,before,after,action.evidence]).map_err(db_error)?;
         changed += 1;
     }
+    if changed == 0 && job.explicit_only && job.code_change.is_none() {
+        let requests = job.messages.iter().filter(|m| m.index > previous && m.role == "user")
+            .map(|m| m.text.trim()).filter(|text| !text.is_empty());
+        if !requests.clone().any(requests_task_sync) && !board_has_turn(&tx, job)? {
+            if let Some(request) = requests.last() {
+                let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                record_conversation(&tx, &job.session_id, &job.turn_id, job.cwd.as_deref(), request, &now)?;
+                changed += 1;
+            }
+        }
+    }
     tx.execute(
         "INSERT INTO chat_sync_events(session,turn) VALUES(?1,?2)",
         params![job.session_id, job.turn_id],
@@ -1406,6 +1558,7 @@ where
     } else {
         true // Preserve analysis of jobs queued by earlier versions.
     };
+    let match_dispatch = edited || (job.explicit_only && !use_ai && !new_user_messages.is_empty());
     let linked = if use_ai { linked_tasks(&db, &job.session_id)? } else { vec![] };
     drop(db);
     let actions = if use_ai {
@@ -1422,7 +1575,7 @@ where
     } else {
         vec![]
     };
-    if edited {
+    if match_dispatch {
         // A short turn can finish before the board's next poll. Match its receipt
         // before applying the code-change event so it won't produce a second card.
         let db = connect(database)?;
@@ -1457,9 +1610,8 @@ where
     apply(&mut connect(database)?, &job, actions, &linked, code_title)
 }
 
-#[tauri::command]
-pub async fn process_chat_sync(app: tauri::AppHandle) -> Result<SyncResult, String> {
-    let (root, database) = paths(&app)?;
+async fn process_chat_sync(app: &tauri::AppHandle) -> Result<SyncResult, String> {
+    let (root, database) = paths(app)?;
     if !root.join("enabled").exists()
         || PROCESSING.swap(true, Ordering::AcqRel)
     {
@@ -1484,6 +1636,17 @@ pub async fn process_chat_sync(app: tauri::AppHandle) -> Result<SyncResult, Stri
         LEGACY_CODE_NOTES_CHECKED.store(true, Ordering::Relaxed);
         if updated_notes > 0 {
             return Ok(SyncResult { updated_notes, ..SyncResult::default() });
+        }
+    }
+    if !CONVERSATION_HISTORY_CHECKED.load(Ordering::Relaxed) {
+        if let Ok(home) = codex_home(app) {
+            let database = database.clone();
+            let result = tauri::async_runtime::spawn_blocking(
+                move || backfill_conversation_records(&mut connect(&database)?, &home)
+            ).await;
+            if matches!(result, Ok(Ok(()))) {
+                CONVERSATION_HISTORY_CHECKED.store(true, Ordering::Relaxed);
+            }
         }
     }
     let Some(file) = queue_files(&root, "json").into_iter().next() else {
@@ -1600,6 +1763,56 @@ mod tests {
         db.execute_batch(SCHEMA).unwrap();
         db
     }
+
+    #[test]
+    fn reads_activity_from_the_notes_synced_and_dispatched_turns() {
+        let home = std::env::temp_dir().join(format!(
+            "conversation-activity-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let archived = home.join("archived_sessions");
+        fs::create_dir_all(&archived).unwrap();
+        let session = "23d9c2e1-bcff-4611-b402-2fd88ab55b65";
+        let mut lines = Vec::new();
+        for (turn, skill, agent, exit_code, kind) in [
+            ("linked", "review", "reviewer", 0, "started"),
+            ("dispatched", "review", "tester", 0, "interacted"),
+            ("undone", "undo-skill", "undo-agent", 0, "started"),
+            ("unrelated", "other-skill", "other-agent", 0, "started"),
+            ("dispatch-failure", "missing-skill", "background-agent", 1, "completed"),
+        ] {
+            lines.extend([
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":turn,"item":{
+                    "type":"CommandExecution","status":"completed","exit_code":exit_code,"parsed_cmd":[
+                        {"type":"read","name":"SKILL.md","path":format!("C:\\skills\\{skill}\\SKILL.md")}
+                    ]
+                }}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":turn,"item":{
+                    "type":"SubAgentActivity","kind":kind,"agent_path":format!("/root/{agent}")
+                }}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}}),
+            ]);
+        }
+        let transcript = lines.into_iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+        fs::write(archived.join(format!("rollout-test-{session}.jsonl")), transcript).unwrap();
+
+        let mut db = db();
+        record_conversation(&db, session, "linked", None, "检查调用记录", "2026-11-27T09:30:00Z").unwrap();
+        let note_id = task_sources(&db).unwrap()[0].note_id;
+        db.execute(
+            "INSERT INTO chat_sync_history(batch,note_id,after_json,evidence,undone) VALUES(?1,?2,'{}','',1)",
+            params![format!("{session}:undone"), note_id],
+        ).unwrap();
+        record_board_dispatch(&mut db, note_id, session, "dispatched").unwrap();
+        let activity = serde_json::to_value(task_activity(&db, &home, note_id).unwrap()).unwrap();
+        assert_eq!(activity, json!({"skills":["review"],"agents":["reviewer","tester"]}));
+
+        record_board_dispatch(&mut db, note_id, session, "dispatch-failure").unwrap();
+        let activity = serde_json::to_value(task_activity(&db, &home, note_id).unwrap()).unwrap();
+        assert_eq!(activity, json!({"skills":["review"],"agents":["reviewer"]}));
+        fs::remove_dir_all(home).unwrap();
+    }
+
     fn job(turn: &str, index: i64, text: &str) -> Job {
         Job {
             session_id: "session".into(),
@@ -2173,10 +2386,13 @@ mod tests {
         ));
         fs::create_dir_all(base.join("codex")).unwrap();
         fs::write(base.join("codex/hooks.json"),r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo existing"}]}]},"description":"keep me"}"#).unwrap();
-        install_hook(&base.join("sync"), &base.join("codex")).unwrap();
+        assert!(install_hook(&base.join("sync"), &base.join("codex")).unwrap());
         let script = base.join("sync/chat-sync-hook.ps1");
+        let config = base.join("codex/hooks.json");
+        let installed = fs::read_to_string(&config).unwrap();
         fs::write(&script, "old version").unwrap();
-        install_hook(&base.join("sync"), &base.join("codex")).unwrap();
+        assert!(!install_hook(&base.join("sync"), &base.join("codex")).unwrap());
+        assert_eq!(fs::read_to_string(config).unwrap(), installed);
         assert!(fs::read_to_string(&script).unwrap().contains("explicit_only"));
         let value: Value =
             serde_json::from_str(&fs::read_to_string(base.join("codex/hooks.json")).unwrap())
@@ -2237,7 +2453,7 @@ mod tests {
     }
 
     #[test]
-    fn code_change_names_are_optional_and_receive_only_the_relevant_request() {
+    fn plain_turns_sync_locally_and_code_changes_keep_their_own_card() {
         let root = std::env::temp_dir().join(format!(
             "sticky-sync-local-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
         ));
@@ -2264,6 +2480,7 @@ mod tests {
             })).unwrap()
         };
         let ordinary = Job { explicit_only: true, ..job("ordinary", 7, "这个页面为什么有两列？") };
+        assert_eq!(process(&ordinary, None), 1);
         assert_eq!(process(&ordinary, None), 0);
         assert_eq!(cursor(&connect(&database).unwrap(), "session").unwrap(), 7);
 
@@ -2279,25 +2496,70 @@ mod tests {
         assert_eq!(process(&edit, None), 0);
         let mut db = connect(&database).unwrap();
         let note: (String, String, String) = db.query_row(
-            "SELECT n.title,n.status,c.name FROM notes n JOIN categories c ON c.id=n.category_id", [],
+            "SELECT n.title,n.status,c.name FROM notes n JOIN categories c ON c.id=n.category_id
+             JOIN chat_sync_links l ON l.note_id=n.id WHERE l.task_key LIKE 'code-change:%'", [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         ).unwrap();
         assert_eq!(note, ("隐藏项目路径".into(), "completed".into(), "project".into()));
         let sources = task_sources(&db).unwrap();
-        assert_eq!(sources.len(), 1);
+        assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].evidence, "Codex 已修改：Board.tsx、board.css");
+        assert!(!sources[0].conversation);
+        assert_eq!(sources[1].evidence, "这个页面为什么有两列？");
+        assert!(sources[1].conversation);
+        assert_eq!(linked_tasks(&db, "session").unwrap().len(), 1);
         assert_eq!(cursor(&db, "session").unwrap(), 10);
         undo(&mut db).unwrap();
-        assert!(task_sources(&db).unwrap().is_empty());
+        assert_eq!(task_sources(&db).unwrap().len(), 1);
         edit.turn_id = "named".into();
         edit.messages[0].index = 13;
         edit.messages[1].index = 14;
         edit.code_change.as_mut().unwrap().index = 15;
         assert_eq!(process(&edit, Some("悬停显示项目路径")), 1);
-        assert_eq!(db.query_row::<String, _, _>("SELECT title FROM notes", [], |row| row.get(0)).unwrap(),
+        assert_eq!(db.query_row::<String, _, _>("SELECT title FROM notes ORDER BY id DESC LIMIT 1", [], |row| row.get(0)).unwrap(),
             "悬停显示项目路径");
         drop(db);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backfills_only_previously_processed_plain_turns_once() {
+        let home = std::env::temp_dir().join(format!(
+            "conversation-history-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let archived = home.join("archived_sessions");
+        fs::create_dir_all(&archived).unwrap();
+        let session = "23d9c2e1-bcff-4611-b402-2fd88ab55b65";
+        let mut lines = vec![json!({"type":"session_meta","payload":{"cwd":"C:/dev/chat"}})];
+        for turn in ["plain", "changed", "aborted", "unsynced", "requested-task"] {
+            lines.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}));
+            let text = if turn == "requested-task" { "记个待办：发报价" } else { "项目有几个入口？" };
+            lines.push(json!({"type":"response_item","payload":{"type":"message","role":"user",
+                "content":[{"type":"input_text","text":"<environment_context>fixture</environment_context>"},
+                           {"type":"input_text","text":text}]}}));
+            if turn == "changed" {
+                lines.push(json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":turn,
+                    "item":{"type":"FileChange","status":"completed"}}}));
+            }
+            let kind = if turn == "aborted" { "turn_aborted" } else { "task_complete" };
+            lines.push(json!({"type":"event_msg","timestamp":"2026-11-19T08:10:00Z","payload":{"type":kind,"turn_id":turn}}));
+        }
+        let transcript = lines.into_iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+        fs::write(archived.join(format!("rollout-test-{session}.jsonl")), transcript).unwrap();
+        let mut db = db();
+        for turn in ["plain", "changed", "aborted", "requested-task"] {
+            db.execute("INSERT INTO chat_sync_events(session,turn) VALUES(?1,?2)", params![session, turn]).unwrap();
+        }
+        backfill_conversation_records(&mut db, &home).unwrap();
+        backfill_conversation_records(&mut db, &home).unwrap();
+        let sources = task_sources(&db).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].session_id, session);
+        assert_eq!(sources[0].usage_turn_id.as_deref(), Some("plain"));
+        assert_eq!(sources[0].synced_at.as_deref(), Some("2026-11-19T08:10:00.000Z"));
+        assert_eq!(sources[0].evidence, "项目有几个入口？");
+        assert!(sources[0].conversation);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

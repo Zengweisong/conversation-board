@@ -18,6 +18,14 @@ pub(crate) struct TurnUsage {
     quota_changes: Vec<QuotaChange>,
     #[serde(skip)]
     ended_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    activity: TurnActivity,
+}
+
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct TurnActivity {
+    skills: BTreeSet<String>,
+    agents: BTreeSet<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -65,23 +73,37 @@ impl UsageCache {
         }
         self.sessions.get(session)
     }
+
+    fn turn(&mut self, home: &Path, session: &str, turn: &str) -> Option<&TurnUsage> {
+        if self.home != home || !self.paths.contains_key(session) {
+            self.refresh_paths(home);
+        }
+        if self.sessions.get(session).is_some_and(|entry| entry.turns.contains_key(turn)) {
+            return self.sessions.get(session)?.turns.get(turn);
+        }
+        if !self.paths.get(session).is_some_and(|path| path.is_file()) {
+            self.refresh_paths(home);
+        }
+        self.read_session(session)?.turns.get(turn)
+    }
 }
 
 pub(crate) fn for_turn(home: &Path, session: &str, turn: &str) -> Option<TurnUsage> {
     let mut cache = CACHE.lock().ok()?;
-    if cache.home != home || !cache.paths.contains_key(session) {
-        cache.refresh_paths(home);
-    }
-    let usage = match cache.sessions.get(session).and_then(|entry| entry.turns.get(turn)) {
-        Some(usage) => usage,
-        None => {
-            if !cache.paths.get(session).is_some_and(|path| path.is_file()) {
-                cache.refresh_paths(home);
-            }
-            cache.read_session(session)?.turns.get(turn)?
-        }
-    };
+    let usage = cache.turn(home, session, turn)?;
     (usage.total_tokens.is_some() || !usage.quota_changes.is_empty()).then(|| usage.clone())
+}
+
+pub(crate) fn activity_for_turns<'a>(home: &Path, turns: impl Iterator<Item = (&'a str, &'a str)>) -> Result<TurnActivity, String> {
+    let mut cache = CACHE.lock().map_err(|_| "无法读取 Codex 调用记录缓存".to_owned())?;
+    let mut activity = TurnActivity::default();
+    for (session, turn_id) in turns {
+        if let Some(turn) = cache.turn(home, session, turn_id) {
+            activity.skills.extend(turn.activity.skills.iter().cloned());
+            activity.agents.extend(turn.activity.agents.iter().cloned());
+        }
+    }
+    Ok(activity)
 }
 
 #[derive(Serialize)]
@@ -218,6 +240,85 @@ fn user_request(line: &str) -> Option<(Option<DateTime<Utc>>, String)> {
     (!request.is_empty()).then(|| (timestamp, request.chars().take(320).collect()))
 }
 
+pub(crate) struct HistoricalConversation {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cwd: Option<String>,
+    pub request: String,
+    pub ended_at: DateTime<Utc>,
+}
+
+pub(crate) fn completed_conversations(
+    home: &Path, candidates: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<HistoricalConversation> {
+    let mut history = Vec::new();
+    if candidates.is_empty() {
+        return history;
+    }
+    for (session_id, path) in transcript_paths(home) {
+        let Some(turns) = candidates.get(&session_id) else { continue };
+        let Ok(file) = File::open(path) else { continue };
+        let mut reader = BufReader::new(file);
+        let mut header = String::new();
+        if reader.read_line(&mut header).is_err() {
+            continue;
+        }
+        let metadata = session_metadata(&header);
+        if metadata.as_ref().is_some_and(SessionMetaPayload::is_subagent) {
+            continue;
+        }
+        let cwd = metadata.and_then(|metadata| metadata.cwd);
+        let mut current: Option<(String, Option<String>, bool)> = None;
+        for line in header.as_bytes().chain(reader).lines().map_while(Result::ok) {
+            if let Some((_, request, false)) = current.as_mut() {
+                if let Some((_, text)) = user_request(&line) {
+                    *request = Some(text);
+                    continue;
+                }
+            }
+            if !line.contains("\"event_msg\"") || !["task_started", "turn_started", "task_complete",
+                "turn_completed", "turn_aborted", "FileChange"].iter().any(|kind| line.contains(kind)) {
+                continue;
+            }
+            let Ok(Record { kind, timestamp, payload }) = serde_json::from_str(&line) else { continue };
+            if kind != "event_msg" { continue; }
+            match payload {
+                Event::TaskStarted { turn_id } | Event::TurnStarted { turn_id } => {
+                    if !current.as_ref().is_some_and(|(id, _, _)| *id == turn_id) {
+                        current = turns.contains(&turn_id).then_some((turn_id, None, false));
+                    }
+                }
+                Event::ItemCompleted { turn_id, item } => {
+                    if let Some((id, _, changed)) = current.as_mut() {
+                        if turn_id.as_ref().is_none_or(|turn| turn == id)
+                            && item["type"] == "FileChange" && item["status"] == "completed"
+                        {
+                            *changed = true;
+                        }
+                    }
+                }
+                Event::TaskComplete { turn_id } | Event::TurnCompleted { turn_id } => {
+                    if !current.as_ref().is_some_and(|(id, _, _)| turn_id.as_ref().is_none_or(|turn| turn == id)) {
+                        continue;
+                    }
+                    if let Some((turn_id, Some(request), false)) = current.take() {
+                        if let Some(ended_at) = timestamp.as_ref().and_then(|time| time.as_str()?.parse().ok()) {
+                            history.push(HistoricalConversation { session_id: session_id.clone(), turn_id, cwd: cwd.clone(), request, ended_at });
+                        }
+                    }
+                }
+                Event::TurnAborted { turn_id } => {
+                    if current.as_ref().is_some_and(|(id, _, _)| turn_id.as_ref().is_none_or(|turn| turn == id)) {
+                        current = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    history
+}
+
 #[derive(Deserialize)]
 struct Record {
     #[serde(rename = "type")]
@@ -268,6 +369,7 @@ enum Event {
     TaskComplete { turn_id: Option<String> },
     TurnCompleted { turn_id: Option<String> },
     TurnAborted { turn_id: Option<String> },
+    ItemCompleted { turn_id: Option<String>, item: serde_json::Value },
     TokenCount { info: Option<TokenInfo>, rate_limits: Option<RateLimits> },
     #[serde(other)]
     Other,
@@ -304,13 +406,15 @@ struct QuotaSeries {
     reset: bool,
 }
 
+const QUOTA_RESET_DRIFT_SECONDS: u64 = 30;
+
 impl QuotaSeries {
     fn record(&mut self, latest: QuotaWindow) {
         self.bounds = Some(match self.bounds {
             Some((first, previous)) => {
-                // The server can report the same reset time a few seconds apart.
+                // Snapshots for the same quota window can report reset times tens of seconds apart.
                 self.reset |= first.window_minutes != latest.window_minutes
-                    || !matches!((first.resets_at, latest.resets_at), (Some(a), Some(b)) if a.abs_diff(b) <= 5)
+                    || !matches!((first.resets_at, latest.resets_at), (Some(a), Some(b)) if a.abs_diff(b) <= QUOTA_RESET_DRIFT_SECONDS)
                     || previous.used_percent > latest.used_percent;
                 (first, latest)
             }
@@ -334,6 +438,32 @@ struct CurrentTurn {
     tokens: u64,
     primary: QuotaSeries,
     secondary: QuotaSeries,
+    activity: TurnActivity,
+}
+
+impl TurnActivity {
+    fn record(&mut self, item: &serde_json::Value) {
+        match item["type"].as_str() {
+            Some("CommandExecution") if item["status"] == "completed" && item["exit_code"].as_i64() == Some(0) => {
+                for command in item["parsed_cmd"].as_array().into_iter().flatten().filter(|command| command["type"] == "read") {
+                    if let Some(path) = command["path"].as_str() {
+                        let mut parts = path.rsplit(['/', '\\']);
+                        if parts.next().is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md")) {
+                            if let Some(name) = parts.next().filter(|name| !name.is_empty() && !matches!(*name, "." | "..")) {
+                                self.skills.insert(name.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("SubAgentActivity") if matches!(item["kind"].as_str(), Some("started" | "interacted")) => {
+                if let Some(name) = item["agent_path"].as_str().and_then(|path| path.rsplit('/').next()).filter(|name| !name.is_empty()) {
+                    self.agents.insert(name.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn read_turns(input: impl BufRead) -> BTreeMap<String, TurnUsage> {
@@ -342,7 +472,7 @@ fn read_turns(input: impl BufRead) -> BTreeMap<String, TurnUsage> {
     let mut previous_tokens = None;
     for line in input.lines().map_while(Result::ok) {
         if !line.contains("\"event_msg\"")
-            || !["token_count", "task_started", "task_complete", "turn_started", "turn_completed", "turn_aborted"]
+            || !["token_count", "task_started", "task_complete", "turn_started", "turn_completed", "turn_aborted", "SKILL.md", "SubAgentActivity"]
                 .iter().any(|kind| line.contains(kind)) { continue; }
         let Ok(Record { kind, timestamp, payload }) = serde_json::from_str(&line) else { continue };
         if kind != "event_msg" { continue; }
@@ -359,7 +489,7 @@ fn read_turns(input: impl BufRead) -> BTreeMap<String, TurnUsage> {
                 let total_tokens = (turn.tokens > 0).then_some(turn.tokens);
                 let quota_changes: Vec<_> = [turn.primary.change(), turn.secondary.change()].into_iter().flatten().collect();
                 let ended_at = event_time().or(turn.started_at);
-                turns.insert(turn.id, TurnUsage { total_tokens, quota_changes, ended_at });
+                turns.insert(turn.id, TurnUsage { total_tokens, quota_changes, ended_at, activity: turn.activity });
             }
             Event::TokenCount { info, rate_limits } => {
                 if let Some(info) = info {
@@ -376,6 +506,11 @@ fn read_turns(input: impl BufRead) -> BTreeMap<String, TurnUsage> {
                         if let Some(window) = limits.primary { turn.primary.record(window); }
                         if let Some(window) = limits.secondary { turn.secondary.record(window); }
                     }
+                }
+            }
+            Event::ItemCompleted { turn_id, item } => {
+                if let Some(turn) = current.as_mut().filter(|turn| turn_id.as_ref().is_none_or(|id| *id == turn.id)) {
+                    turn.activity.record(&item);
                 }
             }
             Event::Other => {}
@@ -481,6 +616,20 @@ mod tests {
         let follow_up = &updated[0].days[1];
         assert_eq!(follow_up.date, Some(local_date("2026-11-26T12:01:00Z")));
         assert_eq!((follow_up.total_tokens, follow_up.turns), (Some(30), 1));
+    }
+
+    #[test]
+    fn keeps_quota_changes_when_the_same_window_has_reset_time_drift() {
+        let mut series = QuotaSeries::default();
+        for (used_percent, resets_at) in [(46.0, 10_000), (49.0, 9_975), (57.0, 10_002)] {
+            series.record(QuotaWindow { window_minutes: Some(300), resets_at: Some(resets_at), used_percent });
+        }
+        let change = series.change().unwrap();
+        assert_eq!(change.window_minutes, 300);
+        assert_eq!(change.percentage_points, 11.0);
+
+        series.record(QuotaWindow { window_minutes: Some(300), resets_at: Some(28_000), used_percent: 58.0 });
+        assert!(series.change().is_none());
     }
 
     #[test]

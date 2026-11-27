@@ -22,6 +22,7 @@ export interface ChatTaskSource {
   syncedAt: string | null;
   archived: boolean;
   manual?: boolean;
+  conversation?: boolean;
   projectId?: string | null;
   dispatchThreadId?: string | null;
   dispatchState?: "running" | "completed" | "failed" | null;

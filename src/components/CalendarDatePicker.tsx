@@ -7,7 +7,7 @@ import { useAnchoredPopover } from "../hooks/useAnchoredPopover";
 
 interface Props {
   value: string; today?: Date; onChange: (value: string) => void;
-  variant?: "compact" | "field"; label?: string; placeholder?: string;
+  variant?: "compact" | "field"; label?: string; placeholder?: string; invalid?: boolean;
 }
 
 const WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"];
@@ -19,7 +19,7 @@ function shiftMonth(date: Date, amount: number) {
   return new Date(first.getFullYear(), first.getMonth(), Math.min(date.getDate(), last));
 }
 
-export function CalendarDatePicker({ value, today = new Date(), onChange, variant = "compact", label = "选择日期", placeholder = "选择日期" }: Props) {
+export function CalendarDatePicker({ value, today = new Date(), onChange, variant = "compact", label = "选择日期", placeholder = "选择日期", invalid }: Props) {
   const id = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const focusDate = useRef(false);
@@ -73,10 +73,11 @@ export function CalendarDatePicker({ value, today = new Date(), onChange, varian
       }} />}
     <button ref={trigger} type="button" className={variant === "field" ? "picker-input" : "calendar-date-trigger"}
       aria-label={variant === "field" ? label : "打开日期选择器"}
+      aria-invalid={invalid}
       title="选择日期" aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? id : undefined}
       onClick={() => open ? closePicker(true) : openPicker()}>
       <CalendarDays size={14} />
-      {variant === "field" && <span className={value ? undefined : "placeholder"}>{value ? value.replace(/-/g, "/") : placeholder}</span>}
+      {variant === "field" && (value || placeholder) && <span className={value ? undefined : "placeholder"}>{value ? value.replace(/-/g, "/") : placeholder}</span>}
     </button>
     {cursor && createPortal(
       <div ref={popup} id={id} className="calendar-picker-popover calendar-date-popover" role="dialog" aria-label="选择日期"

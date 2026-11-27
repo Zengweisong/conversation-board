@@ -184,11 +184,11 @@ export function ProjectUsageDashboard({ projects, tasks, projectIds, initialProj
             leadingIcon={<CalendarDays size={14} />} onChange={setPeriod} />
         </div>
         {period === "custom" && <div className="ci-date-range ci-usage-date-range" role="group" aria-label="自定义用量日期">
-          <div className="ci-usage-date-field"><span aria-hidden="true">开始日期</span>
+          <div className="ci-date-field"><span aria-hidden="true">开始日期</span>
             <CalendarDatePicker variant="field" label="用量开始日期" placeholder="不限"
               value={customDates.start} onChange={(start) => setCustomDates((current) => ({ ...current, start }))} />
           </div>
-          <div className="ci-usage-date-field"><span aria-hidden="true">结束日期</span>
+          <div className="ci-date-field"><span aria-hidden="true">结束日期</span>
             <CalendarDatePicker variant="field" label="用量结束日期" placeholder="不限"
               value={customDates.end} onChange={(end) => setCustomDates((current) => ({ ...current, end }))} />
           </div>

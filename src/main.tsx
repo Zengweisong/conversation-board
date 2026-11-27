@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, Moon, PanelLeftClose, PanelLeftOpen, Settings, Square, X } from "lucide-react";
+import { Gauge, Minus, Moon, PanelLeftClose, PanelLeftOpen, Settings, Square, X } from "lucide-react";
 import { ChatSyncSettings } from "./components/ChatSyncSettings";
 import { SyncAnalysisSettings } from "./components/SyncAnalysisSettings";
 import { ConversationDashboard } from "./components/ConversationDashboard";
@@ -11,7 +12,7 @@ import { ThemeColorPicker } from "./components/ThemeColorPicker";
 import { useCategories } from "./hooks/useCategories";
 import { useNotes } from "./hooks/useNotes";
 import { startBackgroundTaskService } from "./services/backgroundTaskService";
-import { loadSettings, saveAppearance, saveCloseAction } from "./services/settingsService";
+import { loadSettings, saveAppearance, saveCloseAction, saveCodexQuotaVisibility } from "./services/settingsService";
 import { themeColorStyle } from "./services/themeColor";
 import type { AppearanceSettings, AppSettings, CloseAction } from "./types/settings";
 import "./styles.css";
@@ -19,7 +20,7 @@ import "./window.css";
 
 const closeActionOptions: readonly SelectOption<CloseAction>[] = [
   { value: "ask", label: "每次询问" },
-  { value: "minimize", label: "最小化到任务栏" },
+  { value: "minimize", label: "最小化到托盘" },
   { value: "quit", label: "直接关闭" }
 ];
 
@@ -28,6 +29,8 @@ function ConversationBoardApp() {
   const [appearance, setAppearance] = useState<AppSettings | null>(null);
   const [themeBusy, setThemeBusy] = useState(false);
   const [themeError, setThemeError] = useState("");
+  const [quotaBusy, setQuotaBusy] = useState(false);
+  const [quotaError, setQuotaError] = useState("");
   const [themeColorDraft, setThemeColorDraft] = useState<string | null>();
   const [settingsSession, setSettingsSession] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -47,6 +50,26 @@ function ConversationBoardApp() {
     await Promise.all([notes.refresh(), categories.refresh()]);
   }, [notes.refresh, categories.refresh]);
   useEffect(() => startBackgroundTaskService(refresh, setError), [refresh]);
+
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    let current = 0;
+    let disposed = false;
+    const updateWindowShape = async () => {
+      const revision = ++current;
+      const maximized = await appWindow.isMaximized();
+      if (!disposed && revision === current) {
+        document.documentElement.classList.toggle("ci-window-maximized", maximized);
+      }
+    };
+    const refreshWindowShape = () => { void updateWindowShape().catch(() => undefined); };
+    const unlisten = appWindow.onResized(refreshWindowShape);
+    refreshWindowShape();
+    return () => {
+      disposed = true;
+      void unlisten.then((remove) => remove(), () => undefined);
+    };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -72,7 +95,7 @@ function ConversationBoardApp() {
     setAppearance((current) => current && { ...current, closeAction: action });
   }, []);
 
-  const executeClose = useCallback(async (action: Exclude<CloseAction, "ask">, remember = false) => {
+  const executeClose = useCallback(async (action: Exclude<CloseAction, "ask">, remember = false, fromTray = false) => {
     if (closeInFlight.current) return;
     closeInFlight.current = true;
     setCloseBusy(true);
@@ -84,13 +107,17 @@ function ConversationBoardApp() {
       if (remember) await updateCloseAction(action);
       const appWindow = getCurrentWindow();
       if (action === "minimize") {
-        await appWindow.minimize();
+        await appWindow.hide();
         closeDialog.current?.close();
       } else {
         await appWindow.destroy();
       }
     } catch (error) {
       (closeDialog.current?.open ? setCloseError : setError)(String(error instanceof Error ? error.message : error));
+      if (fromTray) {
+        const appWindow = getCurrentWindow();
+        await appWindow.show().then(() => appWindow.unminimize()).then(() => appWindow.setFocus()).catch(() => undefined);
+      }
     } finally {
       closeInFlight.current = false;
       setCloseBusy(false);
@@ -113,9 +140,13 @@ function ConversationBoardApp() {
       event.preventDefault();
       requestClose();
     });
-    void unlisten.catch((error) => setError(String(error)));
-    return () => { void unlisten.then((remove) => remove(), () => undefined); };
-  }, [requestClose]);
+    const unlistenTray = listen("tray-quit-requested", () => void executeClose("quit", false, true));
+    const listeners = [unlisten, unlistenTray];
+    for (const listener of listeners) void listener.catch((error) => setError(String(error)));
+    return () => {
+      for (const listener of listeners) void listener.then((remove) => remove(), () => undefined);
+    };
+  }, [executeClose, requestClose]);
 
   useEffect(() => {
     let disposed = false;
@@ -124,7 +155,7 @@ function ConversationBoardApp() {
       if (busy) return;
       busy = true;
       try {
-        await Promise.allSettled([invoke("process_chat_sync"), invoke("refresh_chat_board_dispatches")]);
+        await invoke("refresh_chat_board_dispatches").catch(() => undefined);
         if (!disposed) await refresh();
       } finally {
         busy = false;
@@ -132,10 +163,13 @@ function ConversationBoardApp() {
     };
     void refresh();
     void poll();
-    const timer = window.setInterval(() => void poll(), 4000);
+    const resume = () => void poll();
+    const timer = window.setInterval(resume, 4000);
+    window.addEventListener("focus", resume);
     return () => {
       disposed = true;
       window.clearInterval(timer);
+      window.removeEventListener("focus", resume);
     };
   }, [refresh]);
 
@@ -144,6 +178,7 @@ function ConversationBoardApp() {
   const appWindow = getCurrentWindow();
   const openSettings = () => {
     setThemeError("");
+    setQuotaError("");
     setThemeColorDraft(undefined);
     setCloseSettingsError("");
     setSettingsSession((session) => session + 1);
@@ -177,6 +212,22 @@ function ConversationBoardApp() {
     if ((color === savedColor && colors === savedThemeColors)
       || await updateAppearance({ darkMode, themeColor: color, savedThemeColors: colors })) {
       setThemeColorDraft(undefined);
+    }
+  }
+
+  async function toggleCodexQuota() {
+    if (!appearance || quotaBusy) return;
+    const showCodexQuota = !appearance.showCodexQuota;
+    setQuotaBusy(true);
+    setQuotaError("");
+    try {
+      await saveCodexQuotaVisibility(showCodexQuota);
+      settingsRevision.current++;
+      setAppearance((current) => current && { ...current, showCodexQuota });
+    } catch {
+      setQuotaError("保存 Codex 额度显示设置失败，请重试");
+    } finally {
+      setQuotaBusy(false);
     }
   }
 
@@ -219,14 +270,14 @@ function ConversationBoardApp() {
         aria-haspopup="dialog" aria-controls="ci-settings-dialog" onClick={openSettings}>
         <Settings size={15} aria-hidden="true" />
       </button>
-      <button type="button" aria-label="最小化" title="最小化" onClick={() => runWindowAction(appWindow.minimize())}><Minus size={16} /></button>
+      <button type="button" aria-label="最小化到托盘" title="最小化到托盘" onClick={() => runWindowAction(appWindow.hide())}><Minus size={16} /></button>
       <button type="button" aria-label="最大化或还原" title="最大化或还原" onClick={() => runWindowAction(appWindow.toggleMaximize())}><Square size={13} /></button>
       <button type="button" className="ci-window-close" aria-label="关闭窗口" title="关闭窗口"
         data-window-close-control onClick={requestClose}><X size={17} /></button>
     </header>
     <div className="content-viewport" style={{ flex: 1 }}>
       <ConversationDashboard notes={notes.notes} categories={categories.categories}
-        sidebarCollapsed={sidebarCollapsed} onNotesChanged={refresh}
+        sidebarCollapsed={sidebarCollapsed} showCodexQuota={appearance.showCodexQuota} onNotesChanged={refresh}
         appAlert={error && <div className="ci-error" role="alert">
           {error} <button type="button" onClick={() => setError("")}>关闭提示</button>
         </div>}
@@ -249,6 +300,14 @@ function ConversationBoardApp() {
             aria-checked={darkMode} disabled={themeBusy}
             onClick={() => void updateAppearance({ darkMode: !darkMode, themeColor: savedColor, savedThemeColors })}><span /></button>
         </div>
+        <div className="ci-theme-mode">
+          <Gauge size={15} aria-hidden="true" />
+          <span id="ci-codex-quota-label">显示 Codex 额度</span>
+          <button type="button" role="switch" className="chat-sync-switch" aria-labelledby="ci-codex-quota-label"
+            aria-checked={appearance.showCodexQuota} disabled={quotaBusy}
+            onClick={() => void toggleCodexQuota()}><span /></button>
+        </div>
+        {quotaError && <p className="chat-sync-error" role="alert">{quotaError}</p>}
         <ThemeColorPicker key={settingsSession} color={themeColor} savedColor={savedColor}
           savedThemeColors={savedThemeColors} busy={themeBusy} onPreview={setThemeColorDraft}
           onCancelPreview={() => setThemeColorDraft(undefined)}
@@ -269,12 +328,12 @@ function ConversationBoardApp() {
       data-window-close-control aria-labelledby="ci-close-title" aria-describedby="ci-close-message"
       onCancel={(event) => { if (closeInFlight.current) event.preventDefault(); }}>
       <h3 id="ci-close-title">关闭对话看板</h3>
-      <p id="ci-close-message">要最小化到任务栏，还是退出对话看板？</p>
+      <p id="ci-close-message">要最小化到托盘，还是退出对话看板？</p>
       <label className="ci-remember-close"><input type="checkbox" ref={rememberChoice} disabled={closeBusy} />记住我的选择</label>
       {closeError && <p className="chat-sync-error" role="alert">{closeError}</p>}
       <form method="dialog" className="dialog-actions">
         <button type="submit" disabled={closeBusy}>取消</button>
-        <button type="button" disabled={closeBusy} onClick={() => void executeClose("minimize", rememberChoice.current?.checked)}>最小化</button>
+        <button type="button" disabled={closeBusy} onClick={() => void executeClose("minimize", rememberChoice.current?.checked)}>最小化到托盘</button>
         <button type="button" className="danger" disabled={closeBusy} onClick={() => void executeClose("quit", rememberChoice.current?.checked)}>直接关闭</button>
       </form>
     </dialog>

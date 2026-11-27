@@ -9,13 +9,20 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const container = document.createElement("div");
 let root: ReturnType<typeof createRoot>;
 afterEach(async () => { await act(async () => root.unmount()); vi.resetAllMocks(); });
-it("only installs the hook after the user enables syncing", async () => {
+it("calls manual sync configuration when the settings switch is clicked", async () => {
   vi.mocked(invoke).mockResolvedValue({ enabled: false, pending: 0, failed: 0, recent: [], canUndo: false });
   root = createRoot(container);
   await act(async () => root.render(<ChatSyncSettings />));
   expect(invoke).not.toHaveBeenCalledWith("configure_chat_sync", expect.anything());
   await act(async () => container.querySelector("button")!.click());
   expect(invoke).toHaveBeenCalledWith("configure_chat_sync", { enabled: true });
+});
+it("shows the restart hint when startup installed the hook", async () => {
+  vi.mocked(invoke).mockResolvedValue({ enabled: true, pending: 0, failed: 0, startupRestartNeeded: true });
+  root = createRoot(container);
+  await act(async () => root.render(<ChatSyncSettings />));
+  expect(container.textContent).toContain("已开启");
+  expect(container.textContent).toContain("请重启聊天客户端");
 });
 it("shows configuration failures without claiming syncing is enabled", async () => {
   vi.mocked(invoke).mockImplementation(async (command) => {

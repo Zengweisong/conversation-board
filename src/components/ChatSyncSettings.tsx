@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { RefreshCw } from "lucide-react";
 
 interface Status {
-  enabled: boolean; pending: number; failed: number; lastError: string | null;
+  enabled: boolean; pending: number; failed: number; lastError: string | null; startupRestartNeeded?: boolean;
 }
 
 export function ChatSyncSettings() {
@@ -39,14 +39,13 @@ export function ChatSyncSettings() {
       <button className="chat-sync-switch" type="button" role="switch" aria-checked={status?.enabled ?? false}
         aria-labelledby="chat-sync-title" title="本机记录代码改动，也可通过 AI 提取明确要求记录的待办和提醒"
         disabled={busy || !status} onClick={() => void run(async () => {
-          const enabled = !status?.enabled;
-          await invoke("configure_chat_sync", { enabled });
-          setNeedsRestart(enabled);
+          const restartNeeded = await invoke<boolean>("configure_chat_sync", { enabled: !status?.enabled });
+          setNeedsRestart(restartNeeded);
         })}>
         <span />
       </button>
     </div>
-    {needsRestart && <p className="chat-sync-hint" role="status">请重启聊天客户端以完成连接</p>}
+    {status?.enabled && (needsRestart || status.startupRestartNeeded) && <p className="chat-sync-hint" role="status">请重启聊天客户端以完成连接</p>}
     {!!status?.failed && <div className="chat-sync-actions">
       <button type="button" disabled={busy} onClick={() => void run(() => invoke("retry_chat_sync"))}><RefreshCw size={14} aria-hidden="true" />重试失败对话<span className="chat-sync-count">{status.failed}</span></button>
     </div>}

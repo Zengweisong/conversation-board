@@ -23,6 +23,7 @@ export interface AppearanceSettings {
 }
 
 export interface AppSettings extends AppearanceSettings {
+  showCodexQuota: boolean;
   opacity: number;
   alwaysOnTop: boolean;
   launchOnStartup: boolean;
@@ -53,6 +54,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   darkMode: false,
   themeColor: null,
   savedThemeColors: [],
+  showCodexQuota: true,
   alwaysOnTop: true,
   launchOnStartup: false,
   showOnStartup: true,

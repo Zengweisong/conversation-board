@@ -1,17 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { Archive, ArchiveRestore, ArrowLeft, CalendarDays, Columns3, FolderClosed, Gauge, MessageSquare, Pencil, Plus, RefreshCw, Search } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, CalendarDays, FolderClosed, Gauge, MessageSquare, Pencil, Plus, RefreshCw, Search } from "lucide-react";
 import type { Note, NoteContentUpdate } from "../types/note";
 import type { Category } from "../types/category";
-import type { BoardStatus } from "../types/board";
-import { codeChangeEvidencePrefix, conversationProjectIds, conversationStats, conversationTasks, datePeriodOptions, dateRangeForPeriod,
-  emptyDateRange, syncedInDateRange, type ChatTaskSource, type CodexProject, type DatePeriod, type ProjectCatalog, type ProjectSettings } from "../services/chatInsightsService";
-import { schedulePartsFromIso } from "../services/noteDateService";
+import { codeChangeEvidencePrefix, conversationProjectIds, conversationTasks, dateInRange, datePeriodOptions, dateRangeForPeriod, isOverdue,
+  emptyDateRange, type ChatTask, type ChatTaskSource, type CodexProject, type DatePeriod, type ProjectCatalog, type ProjectSettings } from "../services/chatInsightsService";
+import { localDateKey, schedulePartsFromIso } from "../services/noteDateService";
 import { ConversationProjects } from "./ConversationProjects";
 import { ProjectUsageDashboard } from "./ProjectUsageDashboard";
 import { CodexThreadPicker, ConversationTaskDispatch, conversationDispatchMessage, sendConversationTask } from "./ConversationTaskDispatch";
 import { NoteCard } from "./NoteCard";
+import { CalendarDatePicker } from "./CalendarDatePicker";
 import { SelectField } from "./SelectField";
 import "./ConversationDashboard.css";
 
@@ -19,6 +19,7 @@ interface Props {
   notes: Note[];
   categories: Category[];
   sidebarCollapsed?: boolean;
+  showCodexQuota?: boolean;
   appAlert?: ReactNode;
   onNotesChanged: () => Promise<void>;
   onEdit: (id: number, input: NoteContentUpdate) => Promise<boolean>;
@@ -26,22 +27,74 @@ interface Props {
 }
 interface SyncStatus { enabled: boolean; pending: number; failed: number; lastError?: string | null; }
 const emptyCatalog: ProjectCatalog = { projects: [], sessionProjects: {} };
-const columns = [
-  { id: "todo", label: "待处理" },
-  { id: "doing", label: "进行中" },
-  { id: "completed", label: "已完成" }
-] as const;
 const usageNumber = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
 const compactUsageNumber = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 });
 const quotaWindowLabel = (minutes: number) => minutes % 1440 === 0 ? `${minutes / 1440} 天`
   : minutes % 60 === 0 ? `${minutes / 60} 小时` : `${minutes} 分钟`;
-const taskStatus = (note: Note): BoardStatus => note.completed ? "completed" : note.status;
 const dateLabel = (value: string | null) => {
   if (!value || Number.isNaN(new Date(value).getTime())) return "时间未知";
   return new Date(value).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 };
+const timelineDateLabel = new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "short" });
+function timelineTimestamp({ note, sources }: ChatTask) {
+  return [note.completedAt, sources[0].syncedAt, note.createdAt]
+    .find((value) => value && Number.isFinite(Date.parse(value))) ?? null;
+}
+function groupTimeline(items: ChatTask[]) {
+  const now = new Date();
+  const today = localDateKey(now);
+  now.setDate(now.getDate() - 1);
+  const yesterday = localDateKey(now);
+  const groups = new Map<string, { label: string; items: ChatTask[] }>();
+  const dated = items.map((item) => {
+    const timestamp = timelineTimestamp(item);
+    return { item, date: timestamp ? new Date(timestamp) : null };
+  }).sort((a, b) => (b.date?.getTime() ?? -Infinity) - (a.date?.getTime() ?? -Infinity));
+  for (const { item, date } of dated) {
+    const day = date ? localDateKey(date) : "";
+    const existing = groups.get(day);
+    if (existing) existing.items.push(item);
+    else groups.set(day, {
+      label: day === today ? "今天" : day === yesterday ? "昨天" : !date ? "日期未知"
+        : day.startsWith(today.slice(0, 4)) ? timelineDateLabel.format(date) : day,
+      items: [item]
+    });
+  }
+  return groups;
+}
 
-export function ConversationDashboard({ notes, categories, sidebarCollapsed = false, appAlert, onNotesChanged, onEdit, saveDraftBeforeClose }: Props) {
+interface TaskActivity { skills: string[]; agents: string[]; }
+
+function CodexTaskActivity({ noteId }: { noteId: number }) {
+  const [activity, setActivity] = useState<"loading" | "error" | TaskActivity>("loading");
+  useEffect(() => {
+    let active = true;
+    invoke<TaskActivity>("get_chat_task_activity", { noteId }).then(
+      (result) => { if (active) setActivity(result); },
+      () => { if (active) setActivity("error"); }
+    );
+    return () => { active = false; };
+  }, [noteId]);
+
+  const rows = typeof activity === "object" ? [
+    { label: "技能", names: activity.skills },
+    { label: "子智能体", names: activity.agents }
+  ] : [];
+  return <section className="ci-editor-activity" aria-label="调用记录">
+    <h3>调用记录</h3>
+    {activity === "loading" ? <p role="status">正在读取调用记录…</p>
+      : activity === "error" ? <p role="status">无法读取调用记录</p>
+      : rows.some(({ names }) => names.length) ? <dl>
+        {rows.map(({ label, names }) => <div key={label}>
+          <dt>{label}</dt>
+          <dd>{names.length ? names.map((name) => <code key={name}>{name}</code>) : "暂无记录"}</dd>
+        </div>)}
+      </dl> : <p>暂无技能或子智能体调用记录</p>}
+  </section>;
+}
+
+export function ConversationDashboard({ notes, categories, sidebarCollapsed = false, showCodexQuota = true,
+  appAlert, onNotesChanged, onEdit, saveDraftBeforeClose }: Props) {
   const [sources, setSources] = useState<ChatTaskSource[] | null>(null);
   const [sync, setSync] = useState<SyncStatus | null>(null);
   const [catalog, setCatalog] = useState<ProjectCatalog | null>(null);
@@ -159,7 +212,10 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
   const activeProjectPath = projectDescriptions.get(activeProject) ?? registeredById.get(activeProject)?.rootPaths.join("\n");
   const dateRange = dateRangeForPeriod(period, customDates);
   const invalidDates = Boolean(dateRange.start && dateRange.end && dateRange.start > dateRange.end);
-  const periodTasks = tasks.filter((task) => syncedInDateRange(task, dateRange));
+  const periodTasks = tasks.filter((task) => {
+    const timestamp = timelineTimestamp(task);
+    return dateInRange(timestamp ? localDateKey(new Date(timestamp)) : null, dateRange);
+  });
   const archivedCount = tasks.filter(({ sources }) => sources[0].archived).length;
   const boardTasks = periodTasks.filter(({ sources }) => sources[0].archived === showArchived);
   const counts = new Map<string, number>();
@@ -176,7 +232,8 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
       && `${note.title} ${note.details ?? ""}`.toLocaleLowerCase().includes(searchTerm);
   });
   const filtered = scopedTasks.filter(({ sources }) => sources[0].archived === showArchived);
-  const stats = conversationStats(scopedTasks.filter(({ sources }) => !sources[0].archived));
+  const timeline = groupTimeline(filtered);
+  const overdue = filtered.filter(({ note }) => isOverdue(note)).length;
   const hasFilters = activeProject !== "all" || trackedOnly || period !== "all" || Boolean(searchTerm);
   const noMatchingTasks = filtered.length === 0 && hasFilters && (!showArchived || archivedCount > 0);
   const emptyProject = activeProject !== "all" && !tasks.some(({ note }) => projectIds.get(note.id) === activeProject);
@@ -202,7 +259,8 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
       let feedback: typeof addFeedback = null;
       if (threadId !== undefined) {
         try {
-          const message = conversationDispatchMessage(await sendConversationTask(task.noteId, threadId, projectId));
+          const result = await sendConversationTask(task.noteId, threadId, projectId);
+          const message = conversationDispatchMessage(result);
           if (message) feedback = { message, error: false };
         } catch (error) {
           feedback = { message: `事项已添加，可在卡片上重试发送。\n${String(error)}`, error: true };
@@ -292,6 +350,76 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
     setRefresh((value) => value + 1);
   };
 
+  function renderTask({ note, sources: evidence }: ChatTask) {
+    const timestamp = timelineTimestamp({ note, sources: evidence });
+    const { date, time } = schedulePartsFromIso(timestamp);
+    const canSend = !showArchived && !note.completed && note.status === "todo";
+    const latestEvidence = evidence.find((source) => source.evidence);
+    const excerpt = latestEvidence?.evidence;
+    const isCodeChange = excerpt?.startsWith(codeChangeEvidencePrefix);
+    const summary = isCodeChange ? null
+      : latestEvidence?.conversation && excerpt === note.title ? note.details : excerpt || note.details;
+    const projectId = projectIds.get(note.id)!;
+    const taskProject = evidence.find((source) => source.manual && source.projectId)?.projectId
+      ?? (registeredById.has(projectId) ? projectId : null);
+    const dispatch = evidence.find(({ dispatchThreadId }) => dispatchThreadId);
+    const usage = evidence.find(({ manual, codexUsage }) => manual && codexUsage)?.codexUsage ?? latestEvidence?.codexUsage;
+    const preferredThreadId = dispatch?.dispatchThreadId ?? evidence.find((source) => source.manual && source.sessionId)?.sessionId ?? evidence.find(({ sessionId }) => sessionId)?.sessionId ?? "";
+    return <article className="ci-task" key={note.id}
+      onClick={(event) => {
+        const { target, currentTarget } = event;
+        if (!(target instanceof Element) || !currentTarget.contains(target) || target.closest("button, a, .ci-task-dispatch")) return;
+        const trigger = currentTarget.querySelector<HTMLButtonElement>(".ci-task-open");
+        if (trigger) openEditor(note.id, trigger);
+      }}>
+      <div className="ci-task-meta">
+        <span className="ci-task-project" title={projectName(projectId)}>{projectName(projectId)}</span>
+        {latestEvidence?.conversation && <span className="ci-task-kind"><MessageSquare size={12} aria-hidden="true" />对话记录</span>}
+        {isCodeChange && <span className="ci-task-kind">代码改动</span>}
+      </div>
+      <button type="button" className="ci-task-open" aria-label={`编辑：${note.title}`} aria-haspopup="dialog"
+        onClick={(event) => openEditor(note.id, event.currentTarget)}>
+        <strong>{note.title}</strong>{summary && <span className="ci-task-evidence">{summary}</span>}
+      </button>
+      {usage && (usage.totalTokens != null || (showCodexQuota && usage.quotaChanges.length > 0)) && <div className="ci-task-usage">
+        {usage.totalTokens != null && <div className="ci-task-token-usage"
+          title={`本轮 Codex 用量 ${usageNumber.format(usage.totalTokens)} Token`}>
+          <span>Codex 用量</span>
+          <strong>{compactUsageNumber.format(usage.totalTokens)} Token</strong>
+        </div>}
+        {showCodexQuota && usage.quotaChanges.length > 0 && <div className="ci-task-quota">
+          {usage.quotaChanges.map(({ windowMinutes, percentagePoints }, index) => {
+            const windowLabel = quotaWindowLabel(windowMinutes);
+            const points = usageNumber.format(percentagePoints);
+            return <div className="ci-task-quota-meter" key={`${windowMinutes}-${index}`} role="meter"
+              aria-label={`${windowLabel}剩余额度降幅`} aria-valuemin={0} aria-valuemax={100}
+              aria-valuenow={percentagePoints} aria-valuetext={`减少 ${points} 个百分点`}
+              title={`${windowLabel}剩余额度减少 ${points} 个百分点。来自账户快照，可能包含同期其他对话。`}>
+              <span className="ci-task-quota-label" aria-hidden="true"><span>{windowLabel}额度</span><strong>−{points} 点</strong></span>
+              <span className="ci-task-quota-track" aria-hidden="true">
+                <span style={{ width: `${percentagePoints}%` }} />
+              </span>
+            </div>;
+          })}
+        </div>}
+      </div>}
+      <ConversationTaskDispatch noteId={note.id} title={note.title} disabled={archiving} canSend={canSend}
+        projectId={taskProject} projectLabel={taskProject && registeredById.has(taskProject) ? projectOption(taskProject) : undefined}
+        preferredThreadId={preferredThreadId} onSent={onNotesChanged} dispatchState={dispatch?.dispatchState}
+        completion={timestamp && date && time && <time className="ci-task-completed-at" dateTime={timestamp}
+          title={`${note.completedAt ? "完成于" : "记录于"} ${date} ${time}`}>{time}</time>}
+        cardActions={<>
+          <button type="button" title={showArchived ? "恢复事项" : "归档事项"} disabled={archiving}
+            aria-label={`${showArchived ? "恢复事项" : "归档事项"} ${note.title}`}
+            onClick={(event) => void setArchived(note.id, !showArchived, event.currentTarget)}>
+            {showArchived ? <ArchiveRestore size={14} aria-hidden="true" /> : <Archive size={14} aria-hidden="true" />}
+          </button>
+          <button type="button" className="ci-task-edit" title="编辑事项" aria-label={`编辑事项 ${note.title}`} aria-haspopup="dialog"
+            onClick={(event) => openEditor(note.id, event.currentTarget)}><Pencil size={14} aria-hidden="true" /></button>
+        </>} />
+    </article>;
+  }
+
   if (showUsage && catalog) return <section className="ci-dashboard ci-analysis-view">
     <ProjectUsageDashboard
       projects={registered.filter(({ hidden, settings }) => !hidden && (!trackedOnly || settings.tracked))}
@@ -321,27 +449,24 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
         {appAlert}
         <header className="ci-header">
           <div className="ci-title">
-            <span className="ci-title-icon"><Columns3 size={22} aria-hidden="true" /></span>
+            <span className="ci-title-icon"><CalendarDays size={22} aria-hidden="true" /></span>
             <div>
-              <h1>对话看板</h1>
+              <h1>{showArchived ? "归档记录" : "记录时间线"}</h1>
               <div className="ci-connection">
                 <span className={`ci-signal ${sync?.enabled ? "connected" : ""}`} />
                 <span>{sync ? sync.enabled ? "自动同步已开启" : "同步未连接" : "正在读取同步状态"}</span>
                 {sync?.pending ? <span>{sync.pending} 轮待分析</span> : null}
                 {sync?.failed ? <span className="ci-warning">{sync.failed} 轮分析失败</span> : null}
+                {overdue > 0 && !showArchived && <span className="ci-warning">{overdue} 项已过期</span>}
               </div>
             </div>
           </div>
-          {sources && <div className="ci-metrics" role="group" aria-label="未归档事项概览">
-            <span className="ci-metric">事项 <strong>{stats.total}</strong></span>
-            <span className="ci-metric">关联对话 <strong>{stats.sessions}</strong></span>
-            {stats.overdue > 0 && <span className="ci-metric ci-warning">{stats.overdue} 项已过期</span>}
-            <div className="ci-completion">
-              <span>完成率</span>
-              <div className="ci-progress-track" role="progressbar" aria-label="事项完成率"
-                aria-valuemin={0} aria-valuemax={100} aria-valuenow={stats.completionRate}><i style={{ width: `${stats.completionRate}%` }} /></div>
-              <strong>{stats.completionRate}%</strong>
-            </div>
+          {sources && !showArchived && <div className="ci-record-actions">
+            <button ref={addTrigger} className="ci-add-task" type="button" aria-label="添加待处理事项"
+              aria-expanded={Boolean(draft)} disabled={Boolean(draft)} onClick={() => {
+                setAddError("");
+                setDraft({ content: "", projectId: registeredById.has(activeProject) ? activeProject : "" });
+              }}><Plus size={16} aria-hidden="true" />添加事项</button>
           </div>}
           <button className="ci-refresh" type="button" aria-label="刷新对话看板" title="刷新看板" disabled={reading}
             onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={15} aria-hidden="true" /></button>
@@ -355,7 +480,7 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
           <div className="ci-board-controls">
             <div className="ci-toolbar">
               <div className="ci-period-picker">
-                <SelectField label="同步日期范围" variant="toolbar" value={period} options={datePeriodOptions}
+                <SelectField label="记录日期范围" variant="toolbar" value={period} options={datePeriodOptions}
                   leadingIcon={<CalendarDays size={14} />} onChange={setPeriod} />
               </div>
               <div className={`ci-project-picker${railCoversProjectFilter ? " ci-project-picker-redundant" : ""}`}>
@@ -370,11 +495,15 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
               }}>{showArchived ? <ArrowLeft size={14} aria-hidden="true" /> : <Archive size={14} aria-hidden="true" />}
                 {showArchived ? "返回看板" : `已归档 ${archivedCount}`}</button>
             </div>
-            {period === "custom" && <div className="ci-date-range" role="group" aria-label="自定义同步日期">
-              <label>开始日期<input type="date" value={customDates.start} max={customDates.end || undefined} aria-invalid={invalidDates}
-                onChange={(event) => setCustomDates({ ...customDates, start: event.target.value })} /></label>
-              <label>结束日期<input type="date" value={customDates.end} min={customDates.start || undefined} aria-invalid={invalidDates}
-                onChange={(event) => setCustomDates({ ...customDates, end: event.target.value })} /></label>
+            {period === "custom" && <div className="ci-date-range" role="group" aria-label="自定义记录日期">
+              <div className="ci-date-field"><span aria-hidden="true">开始日期</span>
+                <CalendarDatePicker variant="field" label="开始日期" placeholder="" invalid={invalidDates}
+                  value={customDates.start} onChange={(start) => setCustomDates((current) => ({ ...current, start }))} />
+              </div>
+              <div className="ci-date-field"><span aria-hidden="true">结束日期</span>
+                <CalendarDatePicker variant="field" label="结束日期" placeholder="" invalid={invalidDates}
+                  value={customDates.end} onChange={(end) => setCustomDates((current) => ({ ...current, end }))} />
+              </div>
               {invalidDates && <span className="ci-warning" role="alert">开始日期不能晚于结束日期</span>}
             </div>}
           </div>
@@ -382,128 +511,59 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
             <span role="status">{emptyProject ? "此项目暂无同步事项" : "没有匹配的事项"}</span>
             <button type="button" onClick={() => { setSearch(""); setProject("all"); setTrackedOnly(false); setPeriod("all"); setCustomDates(emptyDateRange); }}>清除筛选</button>
           </div>}
-          {showArchived && !filtered.length ? (!noMatchingTasks && <div className="ci-empty"><h2>暂无归档事项</h2></div>)
-          : <div className="ci-board">
-            {columns.map((column) => {
-              const items = filtered.filter(({ note }) => taskStatus(note) === column.id);
-              const canAdd = !showArchived && column.id === "todo";
-              return <section className={`ci-column ci-${column.id}`} key={column.id} aria-label={column.label} data-status={column.id}>
-                <header><span className="ci-state-dot" /><h3>{column.label}</h3><span className="ci-column-count">{items.length}</span></header>
-                <div className="ci-column-scroll" role="group" aria-label={`${column.label}事项`}
-                  tabIndex={items.length > 0 || (canAdd && draft) ? 0 : undefined}>
-                  {!items.length && !canAdd && <p className="ci-column-empty">暂无事项</p>}
-                  {items.map(({ note, sources: evidence }) => {
-                    const completedAt = note.completed ? note.completedAt : null;
-                    const { date, time } = schedulePartsFromIso(completedAt);
-                    const latestEvidence = evidence.find((source) => source.evidence);
-                    const summary = latestEvidence?.evidence.startsWith(codeChangeEvidencePrefix) ? null : latestEvidence?.evidence || note.details;
-                    const projectId = projectIds.get(note.id)!;
-                    const taskProject = evidence.find((source) => source.manual && source.projectId)?.projectId
-                      ?? (registeredById.has(projectId) ? projectId : null);
-                    const dispatch = evidence.find(({ dispatchThreadId }) => dispatchThreadId);
-                    const usage = evidence.find(({ manual, codexUsage }) => manual && codexUsage)?.codexUsage ?? latestEvidence?.codexUsage;
-                    const preferredThreadId = dispatch?.dispatchThreadId ?? evidence.find((source) => source.manual && source.sessionId)?.sessionId ?? evidence.find(({ sessionId }) => sessionId)?.sessionId ?? "";
-                    return <article className="ci-task" key={note.id}
-                      onClick={(event) => {
-                        const { target, currentTarget } = event;
-                        if (!(target instanceof Element) || !currentTarget.contains(target) || target.closest("button, a, .ci-task-dispatch")) return;
-                        const trigger = currentTarget.querySelector<HTMLButtonElement>(".ci-task-open");
-                        if (trigger) openEditor(note.id, trigger);
-                      }}>
-                      <div className="ci-task-meta">
-                        <span className="ci-task-project" title={projectName(projectId)}>{projectName(projectId)}</span>
-                      </div>
-                      <button type="button" className="ci-task-open" aria-label={`编辑：${note.title}`} aria-haspopup="dialog"
-                        onClick={(event) => openEditor(note.id, event.currentTarget)}>
-                        <strong>{note.title}</strong>{summary && <span className="ci-task-evidence">{summary}</span>}
-                      </button>
-                      {usage && <div className="ci-task-usage">
-                        {usage.totalTokens != null && <div className="ci-task-token-usage"
-                          title={`本轮 Codex 用量 ${usageNumber.format(usage.totalTokens)} Token`}>
-                          <span>Codex 用量</span>
-                          <strong>{compactUsageNumber.format(usage.totalTokens)} Token</strong>
-                        </div>}
-                        {usage.quotaChanges.length > 0 && <div className="ci-task-quota">
-                          {usage.quotaChanges.map(({ windowMinutes, percentagePoints }, index) => {
-                            const windowLabel = quotaWindowLabel(windowMinutes);
-                            const points = usageNumber.format(percentagePoints);
-                            return <div className="ci-task-quota-meter" key={`${windowMinutes}-${index}`} role="meter"
-                              aria-label={`${windowLabel}剩余额度降幅`} aria-valuemin={0} aria-valuemax={100}
-                              aria-valuenow={percentagePoints} aria-valuetext={`减少 ${points} 个百分点`}
-                              title={`${windowLabel}剩余额度减少 ${points} 个百分点。来自账户快照，可能包含同期其他对话。`}>
-                              <span className="ci-task-quota-label" aria-hidden="true"><span>{windowLabel}额度</span><strong>−{points} 点</strong></span>
-                              <span className="ci-task-quota-track" aria-hidden="true">
-                                <span style={{ width: `${percentagePoints}%` }} />
-                              </span>
-                            </div>;
-                          })}
-                        </div>}
-                      </div>}
-                      <ConversationTaskDispatch noteId={note.id} title={note.title} disabled={archiving} canSend={canAdd}
-                        projectId={taskProject} projectLabel={taskProject && registeredById.has(taskProject) ? projectOption(taskProject) : undefined}
-                        preferredThreadId={preferredThreadId} onSent={onNotesChanged} dispatchState={dispatch?.dispatchState}
-                        completion={completedAt && date && time && <time className="ci-task-completed-at" dateTime={completedAt}
-                          title={`完成于 ${date} ${time}`} aria-label={`完成于 ${date} ${time}`}>{date.slice(5)} {time}</time>}
-                        cardActions={<>
-                          <button type="button" title={showArchived ? "恢复事项" : "归档事项"} disabled={archiving}
-                            aria-label={`${showArchived ? "恢复事项" : "归档事项"} ${note.title}`}
-                            onClick={(event) => void setArchived(note.id, !showArchived, event.currentTarget)}>
-                            {showArchived ? <ArchiveRestore size={14} aria-hidden="true" /> : <Archive size={14} aria-hidden="true" />}
-                          </button>
-                          <button type="button" className="ci-task-edit" title="编辑事项" aria-label={`编辑事项 ${note.title}`} aria-haspopup="dialog"
-                            onClick={(event) => openEditor(note.id, event.currentTarget)}><Pencil size={14} aria-hidden="true" /></button>
-                        </>} />
-                    </article>;
-                  })}
-                  {canAdd && draft && <form ref={addForm} className="ci-create-task" data-popover-root aria-label="添加待处理事项" onSubmit={(event) => { event.preventDefault(); void addTask(); }}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Escape" || adding) return;
-                      event.preventDefault();
-                      closeDraft();
-                    }}>
-                    <input type="text" autoFocus required aria-label="Codex 提示词"
-                      value={draft.content} disabled={adding !== null} onChange={(event) => setDraft({ ...draft, content: event.target.value })}
-                      onPaste={(event) => {
-                        const pasted = event.clipboardData.getData("text/plain");
-                        if (!/[\r\n]/.test(pasted)) return;
-                        event.preventDefault();
-                        const field = event.currentTarget;
-                        field.setRangeText(pasted.replace(/[\t ]*[\r\n][\t \r\n]*/g, " "),
-                          field.selectionStart ?? field.value.length, field.selectionEnd ?? field.value.length, "end");
-                        setDraft({ ...draft, content: field.value });
-                      }} />
-                    {visibleProjectIds.length > 0 && <SelectField label="待处理事项项目" variant="form"
-                      value={draft.projectId} disabled={adding !== null}
-                      options={[{ value: "", label: "不指定项目" },
-                        ...visibleProjectIds.map((id) => ({ value: id, label: projectOption(id) }))]}
-                      onChange={(projectId) => setDraft({ ...draft, projectId })} />}
-                    {!choosingDraftThread && addError && <p className="ci-error" role="alert">{addError}</p>}
-                    <div className="ci-create-task-dispatch ci-send-buttons" role="group" aria-label="添加并发送给 Codex">
-                      <button type="button" className="ci-send-new" disabled={adding !== null || !draft.content.trim()}
-                        onClick={() => void addTask({ threadId: null })}>{adding === "send" && !choosingDraftThread ? "发送中…" : "开启新对话"}</button>
-                      <button type="button" ref={draftThreadTrigger} disabled={adding !== null || !draft.content.trim()}
-                        onClick={() => { setAddError(""); setChoosingDraftThread(true); }}>沿用之前对话</button>
-                    </div>
-                    <div className="ci-create-task-actions">
-                      <button type="button" disabled={adding !== null} onClick={() => closeDraft()}>取消</button>
-                      <button type="submit" disabled={adding !== null || !draft.content.trim()}>{adding === "save" ? "保存中…" : "添加"}</button>
-                    </div>
-                  </form>}
-                </div>
-                {canAdd && !draft && <button ref={addTrigger} className="ci-add-task" type="button" aria-label="添加待处理事项" onClick={() => {
-                  setAddError("");
-                  setDraft({ content: "", projectId: registeredById.has(activeProject) ? activeProject : "" });
-                }}><Plus size={16} aria-hidden="true" />添加事项</button>}
-                {canAdd && draft && choosingDraftThread && createPortal(
-                  <CodexThreadPicker key={draft.projectId} projectId={draft.projectId || null}
-                    projectLabel={draft.projectId ? projectOption(draft.projectId) : undefined}
-                    preferredId="" sending={adding !== null} sendError={addError} onSend={(threadId) => void addTask({ threadId })}
-                    onClose={() => { setChoosingDraftThread(false); setAddError(""); draftThreadTrigger.current?.focus({ preventScroll: true }); }} />,
-                  dashboardRef.current?.closest(".app-shell") ?? document.body,
-                )}
-              </section>;
-            })}
+          {!showArchived && draft && <div className="ci-timeline-composer">
+            {draft && <form ref={addForm} className="ci-create-task" data-popover-root aria-label="添加待处理事项" onSubmit={(event) => { event.preventDefault(); void addTask(); }}
+              onKeyDown={(event) => {
+                if (event.key !== "Escape" || adding) return;
+                event.preventDefault();
+                closeDraft();
+              }}>
+              <input type="text" autoFocus required aria-label="Codex 提示词"
+                value={draft.content} disabled={adding !== null} onChange={(event) => setDraft({ ...draft, content: event.target.value })}
+                onPaste={(event) => {
+                  const pasted = event.clipboardData.getData("text/plain");
+                  if (!/[\r\n]/.test(pasted)) return;
+                  event.preventDefault();
+                  const field = event.currentTarget;
+                  field.setRangeText(pasted.replace(/[\t ]*[\r\n][\t \r\n]*/g, " "),
+                    field.selectionStart ?? field.value.length, field.selectionEnd ?? field.value.length, "end");
+                  setDraft({ ...draft, content: field.value });
+                }} />
+              {visibleProjectIds.length > 0 && <SelectField label="待处理事项项目" variant="form"
+                value={draft.projectId} disabled={adding !== null}
+                options={[{ value: "", label: "不指定项目" },
+                  ...visibleProjectIds.map((id) => ({ value: id, label: projectOption(id) }))]}
+                onChange={(projectId) => setDraft({ ...draft, projectId })} />}
+              {!choosingDraftThread && addError && <p className="ci-error" role="alert">{addError}</p>}
+              <div className="ci-create-task-dispatch ci-send-buttons" role="group" aria-label="添加并发送给 Codex">
+                <button type="button" className="ci-send-new" disabled={adding !== null || !draft.content.trim()}
+                  onClick={() => void addTask({ threadId: null })}>{adding === "send" && !choosingDraftThread ? "发送中…" : "开启新对话"}</button>
+                <button type="button" ref={draftThreadTrigger} disabled={adding !== null || !draft.content.trim()}
+                  onClick={() => { setAddError(""); setChoosingDraftThread(true); }}>沿用之前对话</button>
+              </div>
+              <div className="ci-create-task-actions">
+                <button type="button" disabled={adding !== null} onClick={() => closeDraft()}>取消</button>
+                <button type="submit" disabled={adding !== null || !draft.content.trim()}>{adding === "save" ? "保存中…" : "添加"}</button>
+              </div>
+            </form>}
           </div>}
+          {draft && choosingDraftThread && createPortal(
+            <CodexThreadPicker key={draft.projectId} projectId={draft.projectId || null}
+              projectLabel={draft.projectId ? projectOption(draft.projectId) : undefined}
+              preferredId="" sending={adding !== null} sendError={addError} onSend={(threadId) => void addTask({ threadId })}
+              onClose={() => { setChoosingDraftThread(false); setAddError(""); draftThreadTrigger.current?.focus({ preventScroll: true }); }} />,
+            dashboardRef.current?.closest(".app-shell") ?? document.body,
+          )}
+          <section className="ci-records" aria-label={showArchived ? "归档记录" : "时间线记录"}
+            tabIndex={filtered.length ? 0 : undefined}>
+            {[...timeline].map(([day, { label, items }]) => <section className="ci-timeline-day" key={day}>
+              <h2>{day ? <time dateTime={day}>{label}</time> : label}</h2>
+              <div className="ci-timeline-list">{items.map((task) => renderTask(task))}</div>
+            </section>)}
+            {filtered.length === 0 && !noMatchingTasks && <div className="ci-empty">
+              <h2>{showArchived ? "暂无归档事项" : "暂无记录"}</h2>
+            </div>}
+          </section>
         </>}
       </section>
     </div>
@@ -526,14 +586,17 @@ export function ConversationDashboard({ notes, categories, sidebarCollapsed = fa
           <div className="board-detail-heading"><strong>编辑事项</strong></div>
           <NoteCard key={editing.id} note={editing} categories={categories} contentOnly
             onEdit={(input) => onEdit(editing.id, input)} onCloseEditor={() => setEditingId(null)}
-            editorSupplement={editorSources.length > 0 && <details className="ci-editor-sources">
-              <summary>事项依据</summary>
-              {editorSources.map((source) => <div className="ci-source" key={source.sessionId}>
-                <blockquote>{source.evidence}</blockquote>
-                <time dateTime={source.syncedAt ?? undefined}>{dateLabel(source.syncedAt)}</time>
-                <details><summary>来源对话</summary><code>{source.sessionId}</code></details>
-              </div>)}
-            </details>} />
+            editorSupplement={<>
+              <CodexTaskActivity noteId={editing.id} />
+              {editorSources.length > 0 && <details className="ci-editor-sources">
+                <summary>事项依据</summary>
+                {editorSources.map((source) => <div className="ci-source" key={source.sessionId}>
+                  <blockquote>{source.evidence}</blockquote>
+                  <time dateTime={source.syncedAt ?? undefined}>{dateLabel(source.syncedAt)}</time>
+                  <details><summary>来源对话</summary><code>{source.sessionId}</code></details>
+                </div>)}
+              </details>}
+            </>} />
         </div>
       </div>, dashboardRef.current?.closest(".app-shell") ?? document.body
     )}

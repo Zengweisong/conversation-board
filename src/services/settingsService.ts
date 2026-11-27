@@ -93,6 +93,7 @@ export function normalizeSettings(value: unknown): AppSettings {
     darkMode: booleanValue(saved.darkMode, legacyDark),
     themeColor: themeColor ?? (typeof saved.darkMode === "boolean" ? null : legacyColor),
     savedThemeColors,
+    showCodexQuota: booleanValue(saved.showCodexQuota, DEFAULT_SETTINGS.showCodexQuota),
     alwaysOnTop: booleanValue(saved.alwaysOnTop, DEFAULT_SETTINGS.alwaysOnTop),
     launchOnStartup: booleanValue(saved.launchOnStartup, DEFAULT_SETTINGS.launchOnStartup),
     showOnStartup: booleanValue(saved.showOnStartup, DEFAULT_SETTINGS.showOnStartup),
@@ -207,4 +208,8 @@ export async function saveCloseAction(closeAction: CloseAction): Promise<void> {
     console.error("保存关闭行为失败:", error);
     throw new Error("保存关闭行为失败，请重试");
   }
+}
+
+export async function saveCodexQuotaVisibility(showCodexQuota: boolean): Promise<void> {
+  await patchSettings({ showCodexQuota });
 }
